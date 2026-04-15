@@ -1,0 +1,39 @@
+# Demo app: intentionally crashes to trigger PodRestartingTooMuch alert
+# The SRE Agent will detect this and propose a fix (scale to 0 or fix the command)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-app
+  namespace: demo
+  labels:
+    app: crash-app
+    managed-by: argocd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crash-app
+  template:
+    metadata:
+      labels:
+        app: crash-app
+    spec:
+      containers:
+        - name: crash-container
+          image: busybox:latest
+          # This command intentionally exits 1 to simulate a crash loop
+          # The SRE Agent will detect this and propose: change command to a working one
+          command: ["sh", "-c", "exit 1"]
+          resources:
+            limits:
+              memory: "50Mi"
+              cpu: "50m"
+            requests:
+              memory: "10Mi"
+              cpu: "10m"

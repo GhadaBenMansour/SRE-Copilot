@@ -1,0 +1,209 @@
+{
+  "name": "SRE Copilot - Alert Remediation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sre-alert",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Alertmanager Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "sre-alert"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "check-firing",
+              "leftValue": "={{ $json.body.status }}",
+              "rightValue": "firing",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-firing",
+      "name": "Is Firing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [470, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://sre-agent-service.sre-agent.svc.cluster.local:8000/alert",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 360000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "call-sre-agent",
+      "name": "Call SRE Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [690, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const agentResponse = $input.first().json;\nconst results = agentResponse.results || [];\n\nconst enriched = results.map(r => ({\n  alert: r.alert_name,\n  namespace: r.namespace,\n  severity: r.severity,\n  classification: r.classification,\n  rootCause: r.root_cause,\n  autoRemediated: r.auto_remediation_applied,\n  prUrl: r.git_pr_url || 'none',\n  argoCDSync: r.argocd_sync_triggered,\n  runbook: (r.runbook || []).map(step => `${step.order}. [${step.action}] ${step.description}`).join('\\n'),\n  investigationSteps: (r.investigation_log || []).length,\n}));\n\nif (enriched.length === 0) {\n  return [{ json: { alert: 'unknown', namespace: 'unknown', severity: 'unknown', classification: 'Unknown', rootCause: 'No results from agent', autoRemediated: false, prUrl: 'none', argoCDSync: false, runbook: '', investigationSteps: 0 } }];\n}\n\nreturn enriched.map(e => ({ json: e }));"
+      },
+      "id": "parse-response",
+      "name": "Parse Agent Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [910, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "check-pr",
+              "leftValue": "={{ $json.prUrl }}",
+              "rightValue": "none",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "has-pr",
+      "name": "Has PR?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1130, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nconst severityEmoji = { critical: '🔴', warning: '🟡', info: '🔵' }[data.severity] || '⚪';\n\nconst report = [\n  `${severityEmoji} *SRE Copilot Incident Report*`,\n  `*Alert:* ${data.alert}`,\n  `*Namespace:* ${data.namespace}`,\n  `*Severity:* ${(data.severity || '').toUpperCase()}`,\n  `*Classification:* ${data.classification}`,\n  `*Root Cause:* ${data.rootCause}`,\n  '',\n  `*Auto-Remediated:* ${data.autoRemediated ? '✅ Yes' : '❌ No'}`,\n  data.prUrl && data.prUrl !== 'none' ? `*GitOps PR:* ${data.prUrl}` : '',\n  data.argoCDSync ? '*ArgoCD:* Sync triggered ✅' : '',\n  '',\n  `*Runbook:*`,\n  data.runbook,\n].filter(Boolean).join('\\n');\n\nreturn [{ json: { report, ...data } }];"
+      },
+      "id": "build-report",
+      "name": "Build Incident Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1130, 380]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'processed', message: 'Alert handled by SRE Copilot', results: $('Parse Agent Response').all().map(i => i.json) }) }}"
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1350, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ignored', message: 'Alert not firing, skipped' }) }}"
+      },
+      "id": "ignore-response",
+      "name": "Ignore (Not Firing)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [690, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst timestamp = new Date().toISOString();\n\nconst logEntry = {\n  timestamp,\n  alert: data.alert,\n  namespace: data.namespace,\n  severity: data.severity,\n  classification: data.classification,\n  autoRemediated: data.autoRemediated,\n  prUrl: data.prUrl,\n};\n\nconsole.log('AUDIT:', JSON.stringify(logEntry));\n\nreturn [{ json: { ...data, auditLogged: true, timestamp } }];"
+      },
+      "id": "audit-log",
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1350, 200]
+    }
+  ],
+  "connections": {
+    "Alertmanager Webhook": {
+      "main": [
+        [{ "node": "Is Firing?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Firing?": {
+      "main": [
+        [{ "node": "Call SRE Agent", "type": "main", "index": 0 }],
+        [{ "node": "Ignore (Not Firing)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call SRE Agent": {
+      "main": [
+        [{ "node": "Parse Agent Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Agent Response": {
+      "main": [
+        [
+          { "node": "Has PR?", "type": "main", "index": 0 },
+          { "node": "Build Incident Report", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Has PR?": {
+      "main": [
+        [{ "node": "Audit Log", "type": "main", "index": 0 }],
+        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Audit Log": {
+      "main": [
+        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Incident Report": {
+      "main": [
+        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": ["sre", "monitoring", "gitops"],
+  "triggerCount": 0,
+  "updatedAt": "2026-04-14T00:00:00.000Z",
+  "versionId": "2"
+}

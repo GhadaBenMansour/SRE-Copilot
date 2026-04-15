@@ -1,0 +1,60 @@
+---
+# ArgoCD Application for the SRE Agent itself
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sre-agent
+  namespace: argocd
+  labels:
+    app: sre-copilot
+    component: agent
+spec:
+  project: default
+  source:
+    # Point this to your local gitops-repo.
+    # For local KinD development, use a local path or a file:// URL.
+    repoURL: https://github.com/YOUR_USERNAME/sre-gitops   # Change this
+    targetRevision: HEAD
+    path: apps/sre-agent
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sre-agent
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 2m
+
+---
+# ArgoCD Application for the demo app (the one that crashes)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+  labels:
+    app: sre-copilot
+    component: demo
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/sre-gitops   # Change this
+    targetRevision: HEAD
+    path: apps/demo
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: false    # Don't auto-heal demo app — we want to observe drift
+    syncOptions:
+      - CreateNamespace=true

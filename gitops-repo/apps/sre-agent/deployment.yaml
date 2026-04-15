@@ -1,0 +1,53 @@
+# This is the GitOps-managed version of the SRE Agent deployment.
+# ArgoCD watches this file and syncs it to the cluster.
+# (Same content as sre-agent-deploy.yaml in the root — this is the source of truth)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-agent
+  namespace: sre-agent
+  labels:
+    app: sre-agent
+    version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sre-agent
+  template:
+    metadata:
+      labels:
+        app: sre-agent
+    spec:
+      serviceAccountName: sre-agent-sa
+      containers:
+        - name: sre-agent
+          image: sre-agent:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: sre-agent-config
+            - secretRef:
+                name: sre-agent-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10

@@ -1,0 +1,179 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-agent
+
+---
+# ServiceAccount with cluster-wide read access (for kubectl investigation)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-agent-sa
+  namespace: sre-agent
+
+---
+# ClusterRole: read pods/logs/events + manage deployments for remediation
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-agent-role
+rules:
+  # Read access for investigation
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "namespaces", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Restart/scale deployments for remediation
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+  # Metrics
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-agent-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-agent-role
+subjects:
+  - kind: ServiceAccount
+    name: sre-agent-sa
+    namespace: sre-agent
+
+---
+# Secret for environment variables
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sre-agent-secrets
+  namespace: sre-agent
+type: Opaque
+stringData:
+  GITHUB_TOKEN: ""          # Fill in if using GitHub PRs
+  ARGOCD_TOKEN: ""          # Fill in with ArgoCD API token
+  GIT_USER_NAME: "SRE-Copilot"
+  GIT_USER_EMAIL: "sre-copilot@local"
+
+---
+# ConfigMap for non-sensitive configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-agent-config
+  namespace: sre-agent
+data:
+  OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+  OLLAMA_MODEL: "mistral"
+  ARGOCD_SERVER: "https://argocd-server.argocd.svc.cluster.local"
+  ARGOCD_INSECURE: "true"
+  GITOPS_REPO_PATH: "/gitops-repo"
+  AUTO_REMEDIATE: "false"   # Set to "true" to enable automatic kubectl remediation
+
+---
+# PersistentVolumeClaim for the local gitops repository clone
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitops-repo-pvc
+  namespace: sre-agent
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-agent
+  namespace: sre-agent
+  labels:
+    app: sre-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sre-agent
+  template:
+    metadata:
+      labels:
+        app: sre-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: sre-agent-sa
+      containers:
+        - name: sre-agent
+          image: sre-agent:latest
+          imagePullPolicy: Never       # Using local image built with kind load
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: sre-agent-config
+            - secretRef:
+                name: sre-agent-secrets
+          volumeMounts:
+            - name: gitops-repo
+              mountPath: /gitops-repo
+            - name: kubeconfig
+              mountPath: /root/.kube
+              readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: gitops-repo
+          persistentVolumeClaim:
+            claimName: gitops-repo-pvc
+        - name: kubeconfig
+          secret:
+            secretName: sre-agent-kubeconfig   # Created by setup script
+
+---
+# Service (ClusterIP for internal access + NodePort for local testing)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-agent-service
+  namespace: sre-agent
+spec:
+  selector:
+    app: sre-agent
+  type: NodePort
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
