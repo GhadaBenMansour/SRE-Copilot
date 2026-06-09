@@ -1,0 +1,16 @@
+# Pod qui viole : require-labels
+# Pas de labels 'app' et 'owner' → BLOQUÉ
+apiVersion: v1
+kind: Pod
+metadata:
+  name: violation-no-labels
+  namespace: demo
+  # ← pas de labels du tout (violation)
+spec:
+  containers:
+    - name: nolabel
+      image: nginx:1.27
+      resources:
+        limits:
+          memory: "64Mi"
+          cpu: "100m"

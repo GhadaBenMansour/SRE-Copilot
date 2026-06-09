@@ -1,0 +1,35 @@
+# Application ArgoCD pour la démo SRE Copilot
+# ─────────────────────────────────────────────
+# ArgoCD watch ce repo GitHub et synchronise demo-app.yaml dans le namespace demo.
+# Quand le SRE Agent appelle POST /api/v1/applications/demo-app/sync,
+# ArgoCD ré-applique le manifest depuis Git (= 3ème partie de la boucle GitOps).
+#
+# syncPolicy: pas d'automatique — sinon ArgoCD re-scalerait crash-app à 1
+# immédiatement après que l'agent l'a scaled à 0 (boucle infinie).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+  labels:
+    app: sre-copilot
+    component: demo
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/GhadaBenMansour/SRE-Copilot.git
+    targetRevision: main
+    path: .
+    directory:
+      include: 'demo-app.yaml'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+
+  # Pas de sync automatique : l'agent déclenche manuellement.
+  # syncPolicy absent = mode manuel.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

@@ -63,3 +63,6 @@ class AgentResponse(BaseModel):
     git_pr_url: Optional[str] = None
     argocd_sync_triggered: bool = False
     investigation_log: List[str] = []
+    timestamp: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    pod: Optional[str] = None

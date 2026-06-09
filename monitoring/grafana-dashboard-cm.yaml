@@ -1,0 +1,22 @@
+# ConfigMap qui contient le dashboard SRE Copilot.
+# Le sidecar Grafana (de kube-prometheus-stack) découvre automatiquement les
+# ConfigMaps avec le label 'grafana_dashboard=1' et les importe dans Grafana
+# au runtime. Pas besoin de redéployer Grafana.
+#
+# Appliquer avec :
+#   kubectl create configmap sre-copilot-dashboard \
+#     --from-file=grafana-dashboard.json=monitoring/grafana-dashboard.json \
+#     -n monitoring --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl label configmap sre-copilot-dashboard -n monitoring grafana_dashboard=1 --overwrite
+#
+# OU appliquer directement ce fichier (qui contient déjà tout).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-copilot-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app: sre-copilot
+# Le contenu du dashboard JSON est injecté ici lors du déploiement via
+# `kubectl create configmap --from-file`. Voir scripts/start-sre-copilot.ps1.

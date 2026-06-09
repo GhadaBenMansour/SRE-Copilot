@@ -1,6 +1,52 @@
-﻿venv/
+# ── Python ──
+venv/
+agent/venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# ── Environnement & secrets ──
 .env
+credentials.txt
+*.key
+*.pem
+
+# ── Logs ──
 *.log
-agent/venv/
+
+# ── Fichiers verrou Office (Word/Excel/PowerPoint) ──
+~$*
+*.tmp
+
+# ── IDE / Éditeurs ──
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Données runtime ──
+gitops-repo/
+
+# ── LaTeX — artefacts de compilation (regénérés automatiquement) ──
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.out
+*.bbl
+*.blg
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+*.bcf
+*.run.xml

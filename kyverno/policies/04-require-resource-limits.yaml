@@ -1,0 +1,45 @@
+# Politique 4: Limites de ressources obligatoires
+# ───────────────────────────────────────────────
+# Pourquoi : un pod sans limits.memory peut consommer toute la RAM du nœud →
+# kernel OOM killer tue les autres pods. Sans limits.cpu, idem pour le CPU.
+# Crucial pour la stabilité du cluster et la qualité de service (QoS Guaranteed).
+# Mode : Audit
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+  annotations:
+    policies.kyverno.io/title: Require Resource Limits
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Exige que chaque container ait resources.limits.memory et
+      resources.limits.cpu définis. Évite les pods qui saturent les nœuds.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: check-resource-limits
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - local-path-storage
+      validate:
+        message: >-
+          Les limites de ressources (memory et cpu) sont obligatoires.
+          Exemple : resources: { limits: { memory: 256Mi, cpu: 200m } }
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"

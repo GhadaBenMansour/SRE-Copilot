@@ -1,0 +1,44 @@
+# Politique 3: Labels obligatoires sur les pods
+# ─────────────────────────────────────────────
+# Pourquoi : sans labels standards, on ne peut pas tracer qui possède une charge
+# de travail, à quelle app/version elle appartient. Crucial pour l'observabilité,
+# le filtrage Prometheus, et les requêtes kubectl en production.
+# Labels exigés : app, owner
+# Mode : Audit
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+  annotations:
+    policies.kyverno.io/title: Require Standard Labels
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Exige la présence des labels 'app' et 'owner' sur tous les pods.
+      Permet le filtrage Prometheus, l'attribution des coûts, et l'audit.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: check-required-labels
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - local-path-storage
+      validate:
+        message: >-
+          Les labels 'app' et 'owner' sont obligatoires sur tous les pods.
+          Exemple : labels: { app: mon-app, owner: equipe-data }
+        pattern:
+          metadata:
+            labels:
+              app: "?*"
+              owner: "?*"

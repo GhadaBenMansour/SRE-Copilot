@@ -1,0 +1,45 @@
+# Politique 1: Interdire les conteneurs privilégiés
+# ─────────────────────────────────────────────────
+# Pourquoi : un conteneur privilégié a un accès root au noyau du host, ce qui
+# permet le container breakout. Aucun workload applicatif n'en a besoin en prod.
+# Mode : Audit (génère un PolicyReport sans bloquer — pour visibilité)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  annotations:
+    policies.kyverno.io/title: Disallow Privileged Containers
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Bloque tout pod dont un container ou initContainer a
+      securityContext.privileged=true. Accès root au noyau = surface d'attaque critique.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: check-privileged
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - local-path-storage
+      validate:
+        message: >-
+          Les conteneurs privilégiés sont interdits.
+          Trouvé securityContext.privileged=true sur ce pod.
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"

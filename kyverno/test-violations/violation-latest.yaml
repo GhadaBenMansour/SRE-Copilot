@@ -1,0 +1,18 @@
+# Pod qui viole : disallow-latest-tag
+# image: nginx (= nginx:latest implicite) → BLOQUÉ
+apiVersion: v1
+kind: Pod
+metadata:
+  name: violation-latest
+  namespace: demo
+  labels:
+    app: violation-test
+    owner: pfe-ghada
+spec:
+  containers:
+    - name: bad-image
+      image: nginx:latest      # ← violation
+      resources:
+        limits:
+          memory: "64Mi"
+          cpu: "100m"

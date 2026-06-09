@@ -11,3 +11,6 @@ langchain-community==0.3.7
 
 # HTTP requests (for ArgoCD API)
 requests==2.32.3
+
+# Prometheus metrics (Mission 5)
+prometheus-client==0.21.0

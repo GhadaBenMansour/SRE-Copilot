@@ -5,63 +5,41 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "sre-alert",
-        "responseMode": "responseNode",
+        "responseMode": "onReceived",
         "options": {}
       },
       "id": "webhook-trigger",
       "name": "Alertmanager Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [250, 300],
+      "position": [240, 300],
       "webhookId": "sre-alert"
     },
     {
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "loose"
-          },
-          "conditions": [
-            {
-              "id": "check-firing",
-              "leftValue": "={{ $json.body.status }}",
-              "rightValue": "firing",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
+        "jsCode": "// ── Filter: only firing alerts from namespace 'demo' ──────────────────────\n// ── Dedup: ignore fingerprints already processed within the last 10 minutes ─\nconst body = $input.first().json.body || $input.first().json;\nconst now = Date.now();\nconst TTL = 10 * 60 * 1000; // 10 minutes\n\n// 1. Keep only firing alerts from the demo namespace\nconst demoAlerts = (body.alerts || []).filter(a =>\n  a.status === 'firing' &&\n  (a.labels?.namespace === 'demo' || body.commonLabels?.namespace === 'demo')\n);\n\nif (demoAlerts.length === 0) {\n  console.log('[Filter] No firing demo alerts — stopping execution');\n  return [];\n}\n\n// 2. Deduplication using workflow static data (survives workflow restarts)\nconst store = $getWorkflowStaticData('global');\nif (!store.seen) store.seen = {};\n\n// Evict expired entries\nfor (const [fp, ts] of Object.entries(store.seen)) {\n  if (now - ts > TTL) delete store.seen[fp];\n}\n\n// Filter out already-seen fingerprints\nconst newAlerts = demoAlerts.filter(alert => {\n  const fp = alert.fingerprint ||\n    [alert.labels?.alertname, alert.labels?.namespace, alert.labels?.pod].join('-');\n  if (store.seen[fp]) {\n    const age = Math.round((now - store.seen[fp]) / 1000);\n    console.log(`[Dedup] Alert ${fp} already processed ${age}s ago — skipping`);\n    return false;\n  }\n  store.seen[fp] = now;\n  return true;\n});\n\nif (newAlerts.length === 0) {\n  console.log('[Dedup] All alerts are duplicates within TTL — stopping execution');\n  return [];\n}\n\nconsole.log(`[Filter+Dedup] Passing ${newAlerts.length} new alert(s) to SRE Agent`);\nreturn [{ json: { ...($input.first().json), body: { ...body, alerts: newAlerts } } }];"
       },
-      "id": "check-firing",
-      "name": "Is Firing?",
-      "type": "n8n-nodes-base.if",
+      "id": "filter-dedup",
+      "name": "Filter & Dedup",
+      "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [470, 300]
+      "position": [460, 300]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "http://sre-agent-service.sre-agent.svc.cluster.local:8000/alert",
+        "url": "http://host.docker.internal:8001/alert",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
+            { "name": "Content-Type", "value": "application/json" }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify($json.body) }}",
         "options": {
-          "timeout": 360000,
+          "timeout": 600000,
           "response": {
             "response": {
               "responseFormat": "json"
@@ -73,137 +51,55 @@
       "name": "Call SRE Agent",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [690, 200]
+      "position": [680, 300]
     },
     {
       "parameters": {
-        "jsCode": "const agentResponse = $input.first().json;\nconst results = agentResponse.results || [];\n\nconst enriched = results.map(r => ({\n  alert: r.alert_name,\n  namespace: r.namespace,\n  severity: r.severity,\n  classification: r.classification,\n  rootCause: r.root_cause,\n  autoRemediated: r.auto_remediation_applied,\n  prUrl: r.git_pr_url || 'none',\n  argoCDSync: r.argocd_sync_triggered,\n  runbook: (r.runbook || []).map(step => `${step.order}. [${step.action}] ${step.description}`).join('\\n'),\n  investigationSteps: (r.investigation_log || []).length,\n}));\n\nif (enriched.length === 0) {\n  return [{ json: { alert: 'unknown', namespace: 'unknown', severity: 'unknown', classification: 'Unknown', rootCause: 'No results from agent', autoRemediated: false, prUrl: 'none', argoCDSync: false, runbook: '', investigationSteps: 0 } }];\n}\n\nreturn enriched.map(e => ({ json: e }));"
+        "jsCode": "// Parse and enrich the SRE Agent response for downstream nodes\nconst agentResponse = $input.first().json;\nconst results = agentResponse.results || [];\n\nif (results.length === 0) {\n  console.warn('[Parse] SRE Agent returned 0 results');\n  return [{ json: {\n    alert: 'unknown', namespace: 'unknown', severity: 'unknown',\n    classification: 'Unknown', rootCause: 'No results from agent',\n    autoRemediated: false, prUrl: 'none', argoCDSync: false,\n    runbook: '', investigationSteps: 0\n  }}];\n}\n\nconst enriched = results.map(r => ({\n  alert:            r.alert_name,\n  namespace:        r.namespace,\n  severity:         r.severity,\n  classification:   r.classification,\n  rootCause:        r.root_cause,\n  autoRemediated:   r.auto_remediation_applied,\n  prUrl:            r.git_pr_url || 'none',\n  argoCDSync:       r.argocd_sync_triggered,\n  runbook:          (r.runbook || []).map(s => `${s.order}. [${s.action}] ${s.description} — ${s.command || 'n/a'}`).join('\\n'),\n  investigationSteps: (r.investigation_log || []).length,\n}));\n\nconsole.log(`[Parse] ${enriched.length} result(s): ${enriched.map(e => e.classification).join(', ')}`);\nreturn enriched.map(e => ({ json: e }));"
       },
       "id": "parse-response",
       "name": "Parse Agent Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [910, 200]
+      "position": [900, 300]
     },
     {
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": false,
-            "leftValue": "",
-            "typeValidation": "loose"
-          },
-          "conditions": [
-            {
-              "id": "check-pr",
-              "leftValue": "={{ $json.prUrl }}",
-              "rightValue": "none",
-              "operator": {
-                "type": "string",
-                "operation": "notEquals"
-              }
-            }
-          ],
-          "combinator": "and"
-        }
-      },
-      "id": "has-pr",
-      "name": "Has PR?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [1130, 200]
-    },
-    {
-      "parameters": {
-        "jsCode": "const data = $input.first().json;\n\nconst severityEmoji = { critical: '🔴', warning: '🟡', info: '🔵' }[data.severity] || '⚪';\n\nconst report = [\n  `${severityEmoji} *SRE Copilot Incident Report*`,\n  `*Alert:* ${data.alert}`,\n  `*Namespace:* ${data.namespace}`,\n  `*Severity:* ${(data.severity || '').toUpperCase()}`,\n  `*Classification:* ${data.classification}`,\n  `*Root Cause:* ${data.rootCause}`,\n  '',\n  `*Auto-Remediated:* ${data.autoRemediated ? '✅ Yes' : '❌ No'}`,\n  data.prUrl && data.prUrl !== 'none' ? `*GitOps PR:* ${data.prUrl}` : '',\n  data.argoCDSync ? '*ArgoCD:* Sync triggered ✅' : '',\n  '',\n  `*Runbook:*`,\n  data.runbook,\n].filter(Boolean).join('\\n');\n\nreturn [{ json: { report, ...data } }];"
+        "jsCode": "// Build a human-readable incident report\nconst data = $input.first().json;\nconst timestamp = new Date().toISOString();\n\nconst severityEmoji = { critical: '🔴', warning: '🟡', info: '🔵' }[data.severity] || '⚪';\n\nconst lines = [\n  `${severityEmoji} *SRE Copilot Incident Report*`,\n  `*Timestamp:*      ${timestamp}`,\n  `*Alert:*          ${data.alert}`,\n  `*Namespace:*      ${data.namespace}`,\n  `*Severity:*       ${(data.severity || '').toUpperCase()}`,\n  `*Classification:* ${data.classification}`,\n  `*Root Cause:*     ${data.rootCause}`,\n  '',\n  `*Auto-Remediated:* ${data.autoRemediated ? '✅ Yes' : '❌ No'}`,\n  data.prUrl && data.prUrl !== 'none' ? `*GitOps PR:*       ${data.prUrl}` : null,\n  data.argoCDSync ? `*ArgoCD Sync:*     triggered ✅` : null,\n  '',\n  `*Runbook:*`,\n  data.runbook || '(no runbook generated)',\n  '',\n  `*Investigation steps collected:* ${data.investigationSteps}`,\n].filter(l => l !== null).join('\\n');\n\nconsole.log('AUDIT:', JSON.stringify({\n  timestamp, alert: data.alert, namespace: data.namespace,\n  severity: data.severity, classification: data.classification,\n  autoRemediated: data.autoRemediated, prUrl: data.prUrl,\n}));\n\nreturn [{ json: { report: lines, ...data, timestamp } }];"
       },
       "id": "build-report",
       "name": "Build Incident Report",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1130, 380]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ status: 'processed', message: 'Alert handled by SRE Copilot', results: $('Parse Agent Response').all().map(i => i.json) }) }}"
-      },
-      "id": "webhook-response",
-      "name": "Webhook Response",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [1350, 300]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ status: 'ignored', message: 'Alert not firing, skipped' }) }}"
-      },
-      "id": "ignore-response",
-      "name": "Ignore (Not Firing)",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [690, 420]
-    },
-    {
-      "parameters": {
-        "jsCode": "const data = $input.first().json;\nconst timestamp = new Date().toISOString();\n\nconst logEntry = {\n  timestamp,\n  alert: data.alert,\n  namespace: data.namespace,\n  severity: data.severity,\n  classification: data.classification,\n  autoRemediated: data.autoRemediated,\n  prUrl: data.prUrl,\n};\n\nconsole.log('AUDIT:', JSON.stringify(logEntry));\n\nreturn [{ json: { ...data, auditLogged: true, timestamp } }];"
-      },
-      "id": "audit-log",
-      "name": "Audit Log",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [1350, 200]
+      "position": [1120, 300]
     }
   ],
   "connections": {
     "Alertmanager Webhook": {
-      "main": [
-        [{ "node": "Is Firing?", "type": "main", "index": 0 }]
-      ]
+      "main": [[{ "node": "Filter & Dedup", "type": "main", "index": 0 }]]
     },
-    "Is Firing?": {
-      "main": [
-        [{ "node": "Call SRE Agent", "type": "main", "index": 0 }],
-        [{ "node": "Ignore (Not Firing)", "type": "main", "index": 0 }]
-      ]
+    "Filter & Dedup": {
+      "main": [[{ "node": "Call SRE Agent", "type": "main", "index": 0 }]]
     },
     "Call SRE Agent": {
-      "main": [
-        [{ "node": "Parse Agent Response", "type": "main", "index": 0 }]
-      ]
+      "main": [[{ "node": "Parse Agent Response", "type": "main", "index": 0 }]]
     },
     "Parse Agent Response": {
-      "main": [
-        [
-          { "node": "Has PR?", "type": "main", "index": 0 },
-          { "node": "Build Incident Report", "type": "main", "index": 0 }
-        ]
-      ]
-    },
-    "Has PR?": {
-      "main": [
-        [{ "node": "Audit Log", "type": "main", "index": 0 }],
-        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
-      ]
-    },
-    "Audit Log": {
-      "main": [
-        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
-      ]
-    },
-    "Build Incident Report": {
-      "main": [
-        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
-      ]
+      "main": [[{ "node": "Build Incident Report", "type": "main", "index": 0 }]]
     }
   },
   "settings": {
-    "executionOrder": "v1"
+    "executionOrder": "v1",
+    "maxConcurrentExecutions": 1,
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
   },
   "staticData": null,
   "tags": ["sre", "monitoring", "gitops"],
   "triggerCount": 0,
-  "updatedAt": "2026-04-14T00:00:00.000Z",
-  "versionId": "2"
+  "updatedAt": "2026-05-19T00:00:00.000Z",
+  "versionId": "4"
 }
+

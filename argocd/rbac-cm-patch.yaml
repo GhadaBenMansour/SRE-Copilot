@@ -1,0 +1,16 @@
+# Patch RBAC ArgoCD : autoriser le compte sre-copilot à get/sync/update les Applications.
+# Appliqué via `kubectl apply` qui merge avec la ConfigMap existante.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-rbac-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  policy.default: role:readonly
+  policy.csv: |
+    p, sre-copilot, applications, get, */*, allow
+    p, sre-copilot, applications, sync, */*, allow
+    p, sre-copilot, applications, update, */*, allow

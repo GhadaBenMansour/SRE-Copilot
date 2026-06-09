@@ -1,0 +1,20 @@
+# Pod qui viole : disallow-privileged-containers
+# securityContext.privileged=true → BLOQUÉ par Kyverno (en Audit: warning loggé)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: violation-privileged
+  namespace: demo
+  labels:
+    app: violation-test
+    owner: pfe-ghada
+spec:
+  containers:
+    - name: bad-container
+      image: nginx:1.27
+      securityContext:
+        privileged: true       # ← violation
+      resources:
+        limits:
+          memory: "64Mi"
+          cpu: "100m"

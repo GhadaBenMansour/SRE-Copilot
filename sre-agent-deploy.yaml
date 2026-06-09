@@ -60,7 +60,7 @@ metadata:
 type: Opaque
 stringData:
   GITHUB_TOKEN: ""          # Fill in if using GitHub PRs
-  ARGOCD_TOKEN: ""          # Fill in with ArgoCD API token
+  ARGOCD_TOKEN: ""          # Permanent API key — generate with: scripts/generate-argocd-token.ps1
   GIT_USER_NAME: "SRE-Copilot"
   GIT_USER_EMAIL: "sre-copilot@local"
 
@@ -72,12 +72,13 @@ metadata:
   name: sre-agent-config
   namespace: sre-agent
 data:
-  OLLAMA_BASE_URL: "http://host.docker.internal:11434"
-  OLLAMA_MODEL: "mistral"
-  ARGOCD_SERVER: "https://argocd-server.argocd.svc.cluster.local"
-  ARGOCD_INSECURE: "true"
-  GITOPS_REPO_PATH: "/gitops-repo"
-  AUTO_REMEDIATE: "false"   # Set to "true" to enable automatic kubectl remediation
+  OLLAMA_BASE_URL:   "http://host.docker.internal:11434"
+  OLLAMA_MODEL:      "mistral"
+  ARGOCD_SERVER:     "https://argocd-server.argocd.svc.cluster.local"
+  ARGOCD_INSECURE:   "true"
+  ARGOCD_APP_NAME:   "demo-app"   # ArgoCD application to sync after auto-remediation
+  GITOPS_REPO_PATH:  "/gitops-repo"
+  AUTO_REMEDIATE:    "true"       # Phase 3 active: scale/restart + git commit + ArgoCD sync
 
 ---
 # PersistentVolumeClaim for the local gitops repository clone
@@ -131,9 +132,6 @@ spec:
           volumeMounts:
             - name: gitops-repo
               mountPath: /gitops-repo
-            - name: kubeconfig
-              mountPath: /root/.kube
-              readOnly: true
           resources:
             requests:
               memory: "256Mi"
@@ -157,9 +155,6 @@ spec:
         - name: gitops-repo
           persistentVolumeClaim:
             claimName: gitops-repo-pvc
-        - name: kubeconfig
-          secret:
-            secretName: sre-agent-kubeconfig   # Created by setup script
 
 ---
 # Service (ClusterIP for internal access + NodePort for local testing)
@@ -168,6 +163,8 @@ kind: Service
 metadata:
   name: sre-agent-service
   namespace: sre-agent
+  labels:
+    app: sre-agent
 spec:
   selector:
     app: sre-agent
@@ -177,3 +174,28 @@ spec:
       port: 8000
       targetPort: 8000
       nodePort: 30800
+
+---
+# ServiceMonitor (Mission 5) — Prometheus scrape l'endpoint /metrics du SRE Agent
+# Label `release: monitoring` requis pour que kube-prometheus-stack le découvre
+# (matchLabels du serviceMonitorSelector du Prometheus CR).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sre-agent
+  namespace: monitoring
+  labels:
+    release: monitoring
+    app: sre-agent
+spec:
+  namespaceSelector:
+    matchNames:
+      - sre-agent
+  selector:
+    matchLabels:
+      app: sre-agent
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

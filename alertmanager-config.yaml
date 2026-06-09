@@ -2,50 +2,46 @@ global:
   resolve_timeout: 5m
 
 inhibit_rules:
-- equal:
-  - namespace
-  - alertname
-  source_matchers:
-  - severity = critical
-  target_matchers:
-  - severity =~ warning|info
-- equal:
-  - namespace
-  - alertname
-  source_matchers:
-  - severity = warning
-  target_matchers:
-  - severity = info
-- equal:
-  - namespace
-  source_matchers:
-  - alertname = InfoInhibitor
-  target_matchers:
-  - severity = info
-- target_matchers:
-  - alertname = InfoInhibitor
+- equal: [namespace, alertname]
+  source_matchers: [severity = critical]
+  target_matchers: [severity =~ warning|info]
+- equal: [namespace, alertname]
+  source_matchers: [severity = warning]
+  target_matchers: [severity = info]
+- equal: [namespace]
+  source_matchers: [alertname = InfoInhibitor]
+  target_matchers: [severity = info]
+- target_matchers: [alertname = InfoInhibitor]
 
 receivers:
 - name: "null"
 - name: "n8n-webhook"
   webhook_configs:
-  - url: "http://n8n-service.n8n.svc.cluster.local:5678/webhook/sre-alert"
-    send_resolved: true
+  - url: "http://host.docker.internal:5678/webhook/sre-alert"
+    send_resolved: false
+    http_config:
+      follow_redirects: true
 
 route:
-  group_by:
-  - namespace
-  group_interval: 5m
+  group_by: [namespace, alertname]
   group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h           # Defaults : limite le bruit global
   receiver: "null"
-  repeat_interval: 12h
   routes:
   - matchers:
     - alertname = "Watchdog"
     receiver: "null"
   - matchers:
+    - namespace = "demo"
     - severity =~ "critical|warning"
     receiver: "n8n-webhook"
-
-templates:
-- /etc/alertmanager/config/*.tmpl
+    # group_wait : attendre 1 min avant d'envoyer la PREMIERE alerte d'un groupe
+    # → laisse le temps à Mistral de finir si plusieurs alertes arrivent ensemble
+    group_wait: 1m
+    # group_interval : attendre 15 min entre 2 paquets d'alertes du MÊME groupe
+    # → evite que n8n soit submergé pendant qu'une investigation tourne (~3 min)
+    group_interval: 15m
+    # repeat_interval : ne PAS répéter avant 12h
+    # → la même alerte ne déclenche qu'1 seule investigation par demi-journée
+    repeat_interval: 12h

@@ -1,0 +1,15 @@
+# Pod qui viole : require-resource-limits
+# Pas de resources.limits → BLOQUÉ
+apiVersion: v1
+kind: Pod
+metadata:
+  name: violation-no-limits
+  namespace: demo
+  labels:
+    app: violation-test
+    owner: pfe-ghada
+spec:
+  containers:
+    - name: nolimits
+      image: nginx:1.27
+      # ← pas de bloc resources (violation)

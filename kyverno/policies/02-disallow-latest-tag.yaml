@@ -1,0 +1,61 @@
+# Politique 2: Interdire le tag :latest sur les images
+# ────────────────────────────────────────────────────
+# Pourquoi : :latest est ambigu (peut changer entre 2 pulls) → builds non
+# reproductibles, rollbacks impossibles, debugging cauchemardesque.
+# Mode : Audit
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow :latest Tag
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Bloque les images sans tag ou avec :latest.
+      Force l'usage de tags explicites pour la traçabilité GitOps.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    # Règle 1 : un tag est obligatoire (présence du ":")
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - local-path-storage
+      validate:
+        message: "Un tag d'image est obligatoire (format image:version)."
+        pattern:
+          spec:
+            containers:
+              - image: "*:*"
+
+    # Règle 2 : le tag ne doit pas être :latest
+    - name: validate-image-tag-not-latest
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - local-path-storage
+      validate:
+        message: "Le tag :latest est interdit. Utilisez un tag explicite (ex: :1.2.3)."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
