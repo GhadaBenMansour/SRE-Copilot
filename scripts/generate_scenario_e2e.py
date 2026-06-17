@@ -375,7 +375,7 @@ def add_mission_1(doc):
         "kubectl get pods -n sre-agent    # SRE Agent",
         "kubectl get pods -n kyverno      # 4 controllers Kyverno",
     ], label="COMMANDE")
-    expected_result(doc, "Tous les pods en Running (sauf argocd-applicationset-controller, non bloquant)")
+    expected_result(doc, "Tous les pods en Running. (argocd-applicationset-controller est desactive volontairement par le start script — CRD manquante, inutilise dans le projet)")
 
     # Step 4
     step_title(doc, 4, "Vérifier Ollama et le modèle Mistral")

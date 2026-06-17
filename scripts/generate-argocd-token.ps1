@@ -1,4 +1,4 @@
-# generate-argocd-token.ps1
+﻿# generate-argocd-token.ps1
 # Generates a PERMANENT (non-expiring) ArgoCD API token for the sre-copilot account
 # and injects it directly into the sre-agent-secrets Kubernetes secret.
 #
@@ -67,13 +67,24 @@ if ($payload.PSObject.Properties['exp']) {
     Write-Host "    Token verified: NO exp claim — permanent." -ForegroundColor Green
 }
 
-# ── 5. Read existing secret values to preserve them ───────────────────────────
+# ── 5. Read existing secret values to preserve them (if any) ──────────────────
 Write-Host "[5] Updating $SecretName in namespace $Namespace ..." -ForegroundColor Cyan
 $decode = { param($b64) if ($b64) { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64)) } else { "" } }
-$existing    = kubectl get secret $SecretName -n $Namespace -o json | ConvertFrom-Json
-$githubToken = & $decode ($existing.data.GITHUB_TOKEN)
-$gitName     = & $decode ($existing.data.GIT_USER_NAME)
-$gitEmail    = & $decode ($existing.data.GIT_USER_EMAIL)
+$existingJson = kubectl get secret $SecretName -n $Namespace -o json 2>$null
+if ($LASTEXITCODE -ne 0) {
+    # Secret n'existe pas encore — defaults
+    Write-Host "    (Secret n'existe pas — creation initiale)" -ForegroundColor Yellow
+    $githubToken = ""
+    $gitName     = "SRE-Copilot"
+    $gitEmail    = "sre-copilot@local"
+} else {
+    $existing    = $existingJson | ConvertFrom-Json
+    $githubToken = & $decode ($existing.data.GITHUB_TOKEN)
+    $gitName     = & $decode ($existing.data.GIT_USER_NAME)
+    $gitEmail    = & $decode ($existing.data.GIT_USER_EMAIL)
+    if (-not $gitName)  { $gitName  = "SRE-Copilot" }
+    if (-not $gitEmail) { $gitEmail = "sre-copilot@local" }
+}
 
 kubectl create secret generic $SecretName -n $Namespace `
     --from-literal=GITHUB_TOKEN="$githubToken" `
@@ -82,11 +93,17 @@ kubectl create secret generic $SecretName -n $Namespace `
     --from-literal=GIT_USER_EMAIL="$gitEmail" `
     --dry-run=client -o yaml | kubectl apply -f - 2>&1 | Out-Null
 
-# ── 6. Restart SRE Agent to pick up new token ─────────────────────────────────
+# ── 6. Restart SRE Agent to pick up new token (skip if not deployed yet) ─────
 Write-Host "[6] Restarting SRE Agent deployment ..." -ForegroundColor Cyan
-kubectl rollout restart deployment/sre-agent -n $Namespace 2>&1 | Out-Null
-kubectl rollout status deployment/sre-agent -n $Namespace --timeout=60s 2>&1 | Out-Null
+$deployExists = kubectl get deployment/sre-agent -n $Namespace --no-headers 2>$null
+if ($LASTEXITCODE -eq 0) {
+    kubectl rollout restart deployment/sre-agent -n $Namespace 2>&1 | Out-Null
+    kubectl rollout status deployment/sre-agent -n $Namespace --timeout=60s 2>&1 | Out-Null
+    Write-Host "    SRE Agent redemarre." -ForegroundColor Green
+} else {
+    Write-Host "    (SRE Agent pas encore deploye — le token sera pris au premier deploiement)" -ForegroundColor Yellow
+}
 
 Write-Host ""
-Write-Host "Done! Permanent ArgoCD token injected and SRE Agent restarted." -ForegroundColor Green
+Write-Host "Done! Permanent ArgoCD token injected." -ForegroundColor Green
 Write-Host "Token sub: $($payload.sub)"

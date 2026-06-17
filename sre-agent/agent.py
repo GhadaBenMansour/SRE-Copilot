@@ -108,6 +108,14 @@ Respond with ONLY this JSON (all fields required):
   "argocd_sync_triggered": false
 }}
 
+Classification priority (READ CAREFULLY):
+1. ALWAYS check POD STATUS first. If STATUS contains "CrashLoopBackOff" OR if "Error" + restart_count > 3, classify as "CrashLoopBackOff".
+2. If STATUS shows "OOMKilled" OR pod_describe mentions OOMKilled → "OOMKilled".
+3. If STATUS shows "ImagePullBackOff" OR "ErrImagePull" → "ImagePullBackOff".
+4. If pod events mention CreateContainerConfigError, missing ConfigMap/Secret → "ConfigError".
+5. ConfigError is for CONFIGURATION problems (missing env, secret, configmap), NOT for crashing pods.
+6. Background audit warnings (security policies, admission webhooks) MUST NOT influence the classification — they are advisory.
+
 Fix type guide:
 - "scale_to_zero": use for CrashLoopBackOff (stops the crash loop immediately, safe for demo)
 - "restart": use for transient failures (OOMKilled, ConfigError) where a fresh start may help
@@ -136,11 +144,20 @@ def _collect_kubectl_data(namespace: str, pod: str) -> dict[str, str]:
 
         data["pod_describe"] = _run_kubectl(["describe", "pod", full_pod, "-n", namespace])
 
-    data["namespace_events"] = _run_kubectl([
+    raw_events = _run_kubectl([
         "get", "events", "-n", namespace,
         "--sort-by=.lastTimestamp",
         "--field-selector=type!=Normal",
     ])
+    # Filtrer les events Kyverno PolicyViolation : ce sont des audits de sécurité
+    # en arrière-plan, PAS la cause d'un incident runtime. Les inclure biaise la
+    # classification du LLM (ex: un CrashLoopBackOff est classifié 'ConfigError'
+    # parce que les events sont domines par les warnings Kyverno).
+    filtered_lines = [
+        line for line in raw_events.split("\n")
+        if "PolicyViolation" not in line and "kyverno" not in line.lower()
+    ]
+    data["namespace_events"] = "\n".join(filtered_lines) if filtered_lines else "(no relevant events)"
 
     return data
 

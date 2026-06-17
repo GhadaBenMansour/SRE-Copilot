@@ -456,7 +456,7 @@ def add_phase_a(doc):
         "kubectl get pods -n sre-agent     # SRE Agent",
         "# Tous Running/Ready",
     ], label="VÉRIFICATION CLUSTER")
-    warning_box(doc, "ArgoCD applicationset-controller peut être en CrashLoopBackOff — NON BLOQUANT pour les tests Mission 3.")
+    info_box(doc, "argocd-applicationset-controller est volontairement désactivé (scale=0) par start-sre-copilot.ps1 : la CRD ApplicationSet n'est pas livrée avec install.yaml, et le projet n'utilise que des Application standards (gérées par argocd-application-controller).", HEX_BLUE_BG)
 
     heading3(doc, "Étape A.3 — Vérifier la connectivité Ollama depuis le pod")
     code_block(doc, [

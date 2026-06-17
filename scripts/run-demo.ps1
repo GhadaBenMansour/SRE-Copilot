@@ -1,4 +1,4 @@
-# run-demo.ps1
+﻿# run-demo.ps1
 # Lance UNE démo propre du pipeline SRE Copilot.
 #
 # Prérequis : la stack doit déjà tourner (.\scripts\start-sre-copilot.ps1 OK).

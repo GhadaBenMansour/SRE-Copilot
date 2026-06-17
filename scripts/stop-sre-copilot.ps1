@@ -1,4 +1,4 @@
-Write-Host "===============================" -ForegroundColor Red
+﻿Write-Host "===============================" -ForegroundColor Red
 Write-Host "   SRE COPILOT - ARRET" -ForegroundColor Red
 Write-Host "==============================="
 Write-Host ""

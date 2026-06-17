@@ -51,18 +51,11 @@ subjects:
     namespace: sre-agent
 
 ---
-# Secret for environment variables
-apiVersion: v1
-kind: Secret
-metadata:
-  name: sre-agent-secrets
-  namespace: sre-agent
-type: Opaque
-stringData:
-  GITHUB_TOKEN: ""          # Fill in if using GitHub PRs
-  ARGOCD_TOKEN: ""          # Permanent API key — generate with: scripts/generate-argocd-token.ps1
-  GIT_USER_NAME: "SRE-Copilot"
-  GIT_USER_EMAIL: "sre-copilot@local"
+# NOTE : le Secret sre-agent-secrets N'EST PLUS declare ici.
+# Pourquoi ? Si on le redéclare, chaque `kubectl apply -f sre-agent-deploy.yaml`
+# ÉCRASE le ARGOCD_TOKEN avec une valeur vide (bug constaté).
+# Le secret est géré séparément par : .\scripts\generate-argocd-token.ps1
+# Ce script crée/met à jour le secret et préserve les autres champs.
 
 ---
 # ConfigMap for non-sensitive configuration

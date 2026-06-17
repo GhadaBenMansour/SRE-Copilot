@@ -1,4 +1,4 @@
-Write-Host "===============================" -ForegroundColor Cyan
+﻿Write-Host "===============================" -ForegroundColor Cyan
 Write-Host "   SRE COPILOT ENV STARTUP" -ForegroundColor Cyan
 Write-Host "==============================="
 Write-Host ""
@@ -83,9 +83,31 @@ if ($needsDeploy) {
         --type='json' `
         -p="[{`"op`":`"replace`",`"path`":`"/data/admin.password`",`"value`":`"$HASH_B64`"},{`"op`":`"replace`",`"path`":`"/data/admin.passwordMtime`",`"value`":`"$MTIME_B64`"}]" 2>&1 | Out-Null
     kubectl rollout restart deployment argocd-server -n argocd 2>&1 | Out-Null
+    kubectl rollout status deployment argocd-server -n argocd --timeout=120s 2>&1 | Out-Null
     Write-Host "    ArgoCD OK (admin / Sre@Copilot2026)." -ForegroundColor Green
 
-    Write-Host "    Applications Kubernetes..." -ForegroundColor Yellow
+    # Desactiver applicationset-controller (CRD manquante = CrashLoopBackOff perpetuel,
+    # mais on n'utilise pas les ApplicationSet — voir defense PFE). Scale a 0.
+    kubectl scale deployment argocd-applicationset-controller -n argocd --replicas=0 2>&1 | Out-Null
+    Write-Host "    applicationset-controller desactive (non utilise dans le projet)." -ForegroundColor Gray
+
+    # ── ArgoCD : RBAC sre-copilot + Application demo-app (AVANT le SRE Agent) ──
+    Write-Host "    ArgoCD RBAC + Application demo-app..." -ForegroundColor Yellow
+    kubectl patch configmap argocd-cm -n argocd --type merge `
+        -p '{"data":{"accounts.sre-copilot":"apiKey"}}' 2>&1 | Out-Null
+    kubectl apply -f "$PSScriptRoot\..\argocd\rbac-cm-patch.yaml" 2>&1 | Out-Null
+    kubectl apply -f "$PSScriptRoot\..\argocd\demo-app-application.yaml" 2>&1 | Out-Null
+    kubectl rollout restart deployment argocd-server -n argocd 2>&1 | Out-Null
+    kubectl rollout status deployment argocd-server -n argocd --timeout=120s 2>&1 | Out-Null
+    Write-Host "    ArgoCD RBAC + Application demo-app appliques." -ForegroundColor Green
+
+    # ── Generer + injecter le token ArgoCD permanent (Secret sre-agent-secrets) ──
+    Write-Host "    Token ArgoCD permanent (sre-copilot:apiKey)..." -ForegroundColor Yellow
+    kubectl create namespace sre-agent --dry-run=client -o yaml | kubectl apply -f - 2>&1 | Out-Null
+    & "$PSScriptRoot\generate-argocd-token.ps1" 2>&1 | Where-Object { $_ -match 'Token verified|Done|Token sub|ERREUR|Error' } | ForEach-Object { "      $_" }
+    Write-Host "    Token ArgoCD injecte dans sre-agent-secrets." -ForegroundColor Green
+
+    Write-Host "    Applications Kubernetes (demo-app + PrometheusRule)..." -ForegroundColor Yellow
     kubectl apply -f "$PSScriptRoot\..\demo-app.yaml"          2>&1 | Out-Null
     kubectl apply -f "$PSScriptRoot\..\pod-restart-alert.yaml" 2>&1 | Out-Null
 
@@ -94,7 +116,7 @@ if ($needsDeploy) {
         --from-file=alertmanager.yaml="$PSScriptRoot\..\alertmanager-config.yaml" `
         -n monitoring --dry-run=client -o yaml | kubectl apply -f - 2>&1 | Out-Null
 
-    Write-Host "    SRE Agent..." -ForegroundColor Yellow
+    Write-Host "    SRE Agent (Secret deja rempli avec le token)..." -ForegroundColor Yellow
     kind load docker-image sre-agent:latest --name sre-cluster 2>&1 | Out-Null
     kubectl apply -f "$PSScriptRoot\..\sre-agent-deploy.yaml" 2>&1 | Out-Null
 
@@ -122,16 +144,6 @@ if ($needsDeploy) {
     }
     kubectl apply -f "$PSScriptRoot\..\kyverno\policies\" 2>&1 | Out-Null
     Write-Host "    Kyverno OK (4 ClusterPolicies en mode Audit)." -ForegroundColor Green
-
-    # ── ArgoCD : RBAC sre-copilot + Application demo-app ─────────────────────
-    Write-Host "    ArgoCD RBAC + Application demo-app..." -ForegroundColor Yellow
-    kubectl patch configmap argocd-cm -n argocd --type merge `
-        -p '{"data":{"accounts.sre-copilot":"apiKey"}}' 2>&1 | Out-Null
-    kubectl apply -f "$PSScriptRoot\..\argocd\rbac-cm-patch.yaml" 2>&1 | Out-Null
-    kubectl apply -f "$PSScriptRoot\..\argocd\demo-app-application.yaml" 2>&1 | Out-Null
-    kubectl rollout restart deployment argocd-server -n argocd 2>&1 | Out-Null
-    kubectl rollout status deployment argocd-server -n argocd --timeout=120s 2>&1 | Out-Null
-    Write-Host "    ArgoCD OK (Application demo-app + RBAC applique)." -ForegroundColor Green
 
     # ── Mission 5 : Dashboard Grafana auto-importe via sidecar ────────────────
     Write-Host "    Dashboard Grafana (Mission 5)..." -ForegroundColor Yellow

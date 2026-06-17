@@ -1,4 +1,4 @@
-# reset-demo.ps1
+﻿# reset-demo.ps1
 # Remet l'environnement à zéro entre deux démos / tests.
 # Ne touche PAS au cluster ni à la stack — seulement aux données runtime.
 #
