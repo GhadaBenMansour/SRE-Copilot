@@ -21,7 +21,8 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, FileResponse, StreamingResponse
+from io import BytesIO
 
 from models import AlertManagerPayload, Alert, AgentResponse
 from agent import run_sre_investigation
@@ -253,737 +254,729 @@ async def prometheus_metrics():
     return Response(content=body, media_type=ctype)
 
 
-_DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SRE Copilot</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
-<style>
-  /* ── Design tokens (inspired by Impeccable: OKLCH neutrals, no gradients) ── */
-  :root {
-    /* Tinted neutrals — warm, slightly desaturated */
-    --bg:           oklch(98.5% 0.003 80);
-    --surface:      oklch(100% 0 0);
-    --surface-alt:  oklch(97% 0.005 80);
-    --border:       oklch(91% 0.006 80);
-    --border-soft:  oklch(94% 0.005 80);
-    --text:         oklch(20% 0.015 80);
-    --text-muted:   oklch(50% 0.012 80);
-    --text-soft:    oklch(65% 0.01 80);
+# ── Static assets (PwC logo) ──────────────────────────────────────────────────
 
-    /* Single accent — warm ochre/yellow (Impeccable signature) */
-    --accent:       oklch(72% 0.13 75);
-    --accent-soft:  oklch(95% 0.04 82);
-    --accent-text:  oklch(40% 0.12 70);
+@app.get("/static/logo.png")
+async def static_logo():
+    """Sert le logo PwC officiel utilise par /dashboard et /audit-report."""
+    return FileResponse("logo_pwc.png", media_type="image/png")
 
-    /* Semantic — used sparingly */
-    --success:      oklch(58% 0.13 145);
-    --success-soft: oklch(95% 0.04 145);
-    --danger:       oklch(55% 0.18 25);
-    --danger-soft:  oklch(95% 0.04 25);
-    --warn:         oklch(65% 0.14 60);
-    --warn-soft:    oklch(95% 0.04 80);
 
-    /* Type scale */
-    --font-sans:  "Avenir Next", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    --font-mono:  "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+# ── Audit Report (PwC-style 24h alert report) ────────────────────────────────
 
-    /* 7-step spacing scale */
-    --space-1: 4px;
-    --space-2: 8px;
-    --space-3: 12px;
-    --space-4: 16px;
-    --space-5: 24px;
-    --space-6: 32px;
-    --space-7: 48px;
+from datetime import datetime, timedelta, timezone
 
-    /* Radii — 8px small, 12px medium (no big rounded squares) */
-    --radius-sm: 6px;
-    --radius:    10px;
-  }
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; }
-  body {
-    font-family: var(--font-sans);
-    background: var(--bg);
-    color: var(--text);
-    font-size: 15px;
-    line-height: 1.5;
-    -webkit-font-smoothing: antialiased;
-    font-feature-settings: "ss01", "cv11";
-  }
-  body > .container { max-width: 1240px; margin: 0 auto; padding: var(--space-6) var(--space-5); }
+def _filter_incidents_period(hours: int = 24) -> list[dict]:
+    """Filtre les incidents sur les N dernières heures."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    result = []
+    for i in _read_incidents():
+        ts_str = i.get("timestamp", "")
+        if not ts_str:
+            continue
+        try:
+            # Parse ISO format (avec ou sans timezone)
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= cutoff:
+                result.append(i)
+        except (ValueError, TypeError):
+            continue
+    return result
 
-  /* Lucide icon defaults */
-  .icon {
-    width: 16px; height: 16px;
-    stroke-width: 1.75;
-    flex-shrink: 0;
-    display: inline-block;
-    vertical-align: middle;
-  }
-  .icon-lg { width: 20px; height: 20px; }
-  .icon-sm { width: 14px; height: 14px; }
 
-  /* ── Header ─────────────────────────────────────────────────────── */
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-end;
-    padding-bottom: var(--space-5);
-    margin-bottom: var(--space-6);
-    border-bottom: 1px solid var(--border);
-  }
-  header h1 {
-    font-size: 22px;
-    font-weight: 600;
-    letter-spacing: -0.015em;
-    color: var(--text);
-  }
-  header .eyebrow {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--accent-text);
-    margin-bottom: var(--space-1);
-  }
-  header .controls { display: flex; gap: var(--space-3); align-items: center; }
+def _generate_audit_summary(incidents: list[dict], hours: int) -> dict:
+    """Génère un résumé d'audit structuré façon PwC à partir des incidents."""
+    total = len(incidents)
+    if total == 0:
+        return {
+            "narrative": f"Aucune alerte n'a été reçue sur les {hours} dernières heures. "
+                         f"Le système est en état nominal. Aucune intervention SRE requise.",
+            "kpis": {"total": 0, "auto_remediated": 0, "success_rate": 0.0,
+                     "mttr_seconds": 0.0, "argocd_synced": 0},
+            "classifications": {},
+            "severities":      {},
+            "recommendations": [
+                "Aucune action requise — surveillance active maintenue.",
+            ],
+            "risk_level": "low",
+        }
 
-  /* ── Buttons ────────────────────────────────────────────────────── */
-  .btn {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    height: 32px;
-    padding: 0 var(--space-3);
-    background: var(--surface);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    font-family: inherit;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 120ms ease, border-color 120ms ease;
-  }
-  .btn:hover  { background: var(--surface-alt); border-color: var(--text-soft); }
-  .btn:active { background: var(--border-soft); }
-  .btn-ghost  { background: transparent; border-color: transparent; color: var(--text-muted); }
-  .btn-ghost:hover { background: var(--surface-alt); color: var(--text); }
+    auto_remediated = sum(1 for i in incidents if i.get("auto_remediation_applied"))
+    argocd_synced   = sum(1 for i in incidents if i.get("argocd_sync_triggered"))
+    durations       = [i.get("duration_seconds") for i in incidents if i.get("duration_seconds") is not None]
+    mttr            = round(sum(durations) / len(durations), 1) if durations else 0.0
+    rate            = round(100.0 * auto_remediated / total, 1)
 
-  .last-update { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    classifications = Counter(i.get("classification", "Unknown") for i in incidents)
+    severities      = Counter(i.get("severity", "info")          for i in incidents)
+    top_class       = classifications.most_common(1)[0] if classifications else ("None", 0)
+    critical_count  = severities.get("critical", 0)
 
-  .toggle {
-    display: inline-flex; align-items: center; gap: var(--space-2);
-    font-size: 13px; color: var(--text-muted); cursor: pointer; user-select: none;
-  }
-  .toggle input { accent-color: var(--accent); cursor: pointer; }
+    # Narrative en français pro
+    narrative = (
+        f"Pendant les {hours} dernières heures, l'agent SRE Copilot a traité "
+        f"{total} incident(s). Le taux de remédiation automatique atteint {rate}% "
+        f"({auto_remediated}/{total}). Le temps moyen de remédiation (MTTR) "
+        f"s'élève à {mttr:.0f} secondes. La classification la plus fréquente "
+        f"est « {top_class[0]} » ({top_class[1]} cas). "
+        f"{critical_count} alerte(s) de sévérité critique ont été détectées."
+    )
 
-  /* ── Stats row ──────────────────────────────────────────────────── */
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: var(--space-3);
-    margin-bottom: var(--space-6);
-  }
-  @media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+    # Recommandations générées à partir des patterns observés
+    recommendations = []
+    if rate < 80:
+        recommendations.append(
+            f"Le taux de remédiation automatique ({rate}%) est inférieur au seuil de 80%. "
+            f"Identifier les classifications non-remédiables et étendre la couverture des fix_type."
+        )
+    if mttr > 200:
+        recommendations.append(
+            f"Le MTTR moyen ({mttr:.0f}s) dépasse 200 secondes, principalement à cause "
+            f"du temps d'inférence Mistral 7B sur CPU. Envisager un GPU ou un modèle "
+            f"plus léger pour la production."
+        )
+    if classifications.get("Unknown", 0) > total * 0.1:
+        recommendations.append(
+            f"{classifications['Unknown']} incident(s) classifiés Unknown. "
+            f"Réviser le prompt LLM ou enrichir le keyword fallback."
+        )
+    if critical_count > total * 0.5:
+        recommendations.append(
+            f"Plus de 50% des alertes sont critiques. Analyser les causes racines récurrentes "
+            f"et envisager des actions préventives en amont (Kyverno, quotas, limites)."
+        )
+    if argocd_synced == 0 and auto_remediated > 0:
+        recommendations.append(
+            "Aucune synchronisation ArgoCD n'a été déclenchée. Vérifier que l'agent "
+            "a accès au token API ArgoCD et que l'Application demo-app est enregistrée."
+        )
+    if not recommendations:
+        recommendations.append(
+            "Le système opère dans les standards attendus. Maintenir la surveillance "
+            "continue et conserver les garde-fous actuels (anti-boucle, validator)."
+        )
 
-  .stat {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-4) var(--space-4);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-  .stat-head {
-    display: flex; align-items: center; justify-content: space-between;
-    color: var(--text-muted);
-  }
-  .stat-label { font-size: 12px; font-weight: 500; color: var(--text-muted); }
-  .stat-value {
-    font-size: 28px; font-weight: 600; color: var(--text);
-    letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
-  }
-  .stat-unit { font-size: 14px; color: var(--text-muted); margin-left: 2px; font-weight: 400; }
-  .stat-icon { color: var(--text-soft); }
+    # Niveau de risque global (low / medium / high)
+    if rate < 50 or critical_count > total * 0.7:
+        risk = "high"
+    elif rate < 80 or mttr > 250:
+        risk = "medium"
+    else:
+        risk = "low"
 
-  /* ── Cards (charts, incidents) ──────────────────────────────────── */
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-5);
-  }
-  .card-head {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: var(--space-4);
-  }
-  .card-title {
-    font-size: 13px; font-weight: 600; color: var(--text);
-    display: flex; align-items: center; gap: var(--space-2);
-  }
-  .card-title .icon { color: var(--text-muted); }
-
-  /* ── Charts row ─────────────────────────────────────────────────── */
-  .charts {
-    display: grid;
-    grid-template-columns: 1fr 1.6fr;
-    gap: var(--space-4);
-    margin-bottom: var(--space-6);
-  }
-  @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } }
-  .chart-wrap { position: relative; height: 240px; }
-
-  /* ── Incidents list ─────────────────────────────────────────────── */
-  .search {
-    display: flex; align-items: center; gap: var(--space-2);
-    padding: 0 var(--space-3);
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    width: 280px;
-    transition: border-color 120ms ease;
-  }
-  .search:focus-within { border-color: var(--accent); }
-  .search .icon { color: var(--text-muted); }
-  .search input {
-    border: none; outline: none; background: transparent;
-    width: 100%; height: 32px;
-    font-family: inherit; font-size: 13px; color: var(--text);
-  }
-  .search input::placeholder { color: var(--text-soft); }
-
-  .incident {
-    border-top: 1px solid var(--border-soft);
-  }
-  .incident:first-child { border-top: 1px solid var(--border); }
-
-  .incident-row {
-    display: grid;
-    grid-template-columns: 16px 160px 200px minmax(0, 1fr) 96px 132px;
-    gap: var(--space-4);
-    align-items: center;
-    padding: var(--space-3) var(--space-1);
-    cursor: pointer;
-    transition: background 120ms ease;
-  }
-  .incident-row:hover { background: var(--surface-alt); }
-  .incident.open > .incident-row { background: var(--surface-alt); }
-
-  .chev {
-    color: var(--text-soft);
-    transition: transform 160ms ease;
-  }
-  .incident.open .chev { transform: rotate(90deg); }
-
-  .meta-time {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
-  }
-  .meta-class {
-    font-weight: 600; font-size: 14px; color: var(--text);
-    letter-spacing: -0.005em;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    display: flex; align-items: center; gap: var(--space-2);
-  }
-  .meta-pod {
-    font-family: var(--font-mono); font-size: 12px;
-    color: var(--text-muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    min-width: 0;
-  }
-
-  /* ── Badges (status pills) ──────────────────────────────────────── */
-  .badge {
-    display: inline-flex; align-items: center; justify-content: center;
-    gap: 4px;
-    height: 22px; padding: 0 var(--space-2);
-    border-radius: 999px;
-    font-size: 11px; font-weight: 600;
-    letter-spacing: 0.02em;
-    white-space: nowrap;
-    border: 1px solid transparent;
-  }
-  .badge .icon { width: 12px; height: 12px; stroke-width: 2; }
-
-  .badge-critical { color: var(--danger);   background: var(--danger-soft);  border-color: oklch(85% 0.05 25); }
-  .badge-warning  { color: var(--warn);     background: var(--warn-soft);    border-color: oklch(85% 0.05 60); }
-  .badge-info     { color: var(--accent-text); background: var(--accent-soft); border-color: oklch(85% 0.05 82); }
-  .badge-ok       { color: var(--success);  background: var(--success-soft); border-color: oklch(82% 0.05 145); }
-  .badge-skip     { color: var(--text-muted); background: var(--surface-alt); border-color: var(--border); }
-
-  /* ── Incident body (expanded view) ──────────────────────────────── */
-  .incident-body {
-    display: none;
-    padding: var(--space-5);
-    background: var(--surface-alt);
-    border-top: 1px solid var(--border);
-  }
-  .incident.open > .incident-body { display: block; }
-
-  .field { margin-bottom: var(--space-4); }
-  .field:last-child { margin-bottom: 0; }
-  .field-label {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text-muted);
-    margin-bottom: var(--space-2);
-    display: flex; align-items: center; gap: var(--space-2);
-  }
-  .field-label .icon { width: 13px; height: 13px; color: var(--text-soft); }
-  .field-value { font-size: 14px; color: var(--text); line-height: 1.6; word-break: break-word; }
-
-  .runbook-step {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: var(--space-3);
-    margin-bottom: var(--space-2);
-  }
-  .runbook-step .step-action {
-    font-weight: 600; font-size: 13px; color: var(--text);
-    display: flex; align-items: center; gap: var(--space-2);
-  }
-  .runbook-step .step-num {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 18px; height: 18px;
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent-text);
-    font-size: 10px; font-weight: 700;
-    font-variant-numeric: tabular-nums;
-  }
-  .runbook-step .step-cmd {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    background: oklch(15% 0.005 80);
-    color: oklch(92% 0.02 80);
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-sm);
-    margin: var(--space-2) 0;
-    overflow-x: auto;
-    white-space: pre;
-    line-height: 1.55;
-  }
-  .runbook-step .step-desc {
-    font-size: 13px; color: var(--text-muted); line-height: 1.55;
-  }
-
-  .raw-json {
-    background: oklch(15% 0.005 80);
-    color: oklch(86% 0.05 145);
-    padding: var(--space-3);
-    border-radius: var(--radius-sm);
-    font-family: var(--font-mono); font-size: 12px;
-    max-height: 320px; overflow: auto;
-    white-space: pre-wrap; word-break: break-word;
-    line-height: 1.55;
-  }
-
-  .metrics-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: var(--space-3);
-  }
-  .metric-item {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: var(--space-3);
-  }
-  .metric-item .label {
-    font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
-    text-transform: uppercase; color: var(--text-muted);
-    margin-bottom: var(--space-1);
-    display: flex; align-items: center; gap: 6px;
-  }
-  .metric-item .label .icon { width: 12px; height: 12px; }
-  .metric-item .value {
-    font-size: 14px; color: var(--text); font-weight: 500;
-    word-break: break-all;
-  }
-
-  /* ── Empty states ───────────────────────────────────────────────── */
-  .empty {
-    text-align: center;
-    padding: var(--space-7) var(--space-5);
-    color: var(--text-muted);
-  }
-  .empty .icon { width: 32px; height: 32px; color: var(--text-soft); margin-bottom: var(--space-3); }
-  .empty p { font-size: 14px; }
-  .empty small {
-    display: block; margin-top: var(--space-2);
-    font-size: 12px; color: var(--text-soft);
-  }
-
-  /* ── Footer ─────────────────────────────────────────────────────── */
-  footer {
-    margin-top: var(--space-7);
-    padding-top: var(--space-4);
-    border-top: 1px solid var(--border);
-    text-align: center;
-    color: var(--text-soft);
-    font-size: 11px;
-  }
-  footer code {
-    font-family: var(--font-mono);
-    background: var(--surface-alt);
-    padding: 2px 6px;
-    border-radius: 4px;
-    border: 1px solid var(--border-soft);
-  }
-
-  /* ── Responsive ─────────────────────────────────────────────────── */
-  @media (max-width: 1100px) {
-    .incident-row { grid-template-columns: 16px 140px minmax(0, 1fr) 90px 132px; }
-    .meta-class { display: none; }
-  }
-  @media (max-width: 700px) {
-    body > .container { padding: var(--space-4); }
-    header { flex-direction: column; align-items: flex-start; gap: var(--space-3); }
-    .incident-row { grid-template-columns: 16px minmax(0, 1fr) 132px; }
-    .meta-time, .meta-pod { display: none; }
-    .search { width: 100%; }
-    .metrics-grid { grid-template-columns: 1fr; }
-  }
-</style>
-</head>
-<body>
-<div class="container">
-
-  <header>
-    <div>
-      <div class="eyebrow">SRE Copilot · PFE IFS 013/26</div>
-      <h1>Incidents &amp; remédiation automatique</h1>
-    </div>
-    <div class="controls">
-      <span id="last-update" class="last-update">—</span>
-      <button class="btn" onclick="loadAll()" title="Rafraîchir">
-        <i data-lucide="refresh-cw" class="icon"></i>
-        <span>Rafraîchir</span>
-      </button>
-      <label class="toggle">
-        <input type="checkbox" id="auto-refresh" checked>
-        Auto 30s
-      </label>
-    </div>
-  </header>
-
-  <section class="stats" id="stats"></section>
-
-  <section class="charts">
-    <div class="card">
-      <div class="card-head">
-        <div class="card-title">
-          <i data-lucide="pie-chart" class="icon"></i>
-          Classifications
-        </div>
-      </div>
-      <div class="chart-wrap" id="wrap-class"><canvas id="chart-class"></canvas></div>
-    </div>
-    <div class="card">
-      <div class="card-head">
-        <div class="card-title">
-          <i data-lucide="bar-chart-3" class="icon"></i>
-          Volume par jour
-        </div>
-      </div>
-      <div class="chart-wrap" id="wrap-timeline"><canvas id="chart-timeline"></canvas></div>
-    </div>
-  </section>
-
-  <section class="card">
-    <div class="card-head">
-      <div class="card-title">
-        <i data-lucide="list" class="icon"></i>
-        Incidents récents
-        <span class="last-update" id="incidents-count"></span>
-      </div>
-      <div class="search">
-        <i data-lucide="search" class="icon icon-sm"></i>
-        <input type="text" id="q" placeholder="Filtrer par classification, pod, namespace…" oninput="renderFiltered()">
-      </div>
-    </div>
-    <div id="incidents-list"></div>
-  </section>
-
-  <footer>
-    SRE Copilot — données persistées dans <code>/gitops-repo/incidents/responses.jsonl</code>
-  </footer>
-
-</div>
-
-<script>
-let chartClass = null, chartTimeline = null;
-let allIncidents = [];
-
-// Icon used in stat cards (paired with label)
-const STAT_ICONS = {
-  total:     'activity',
-  remediated:'check-circle-2',
-  rate:      'gauge',
-  mttr:      'clock',
-  argocd:    'git-branch',
-};
-
-async function loadStats() {
-  const r = await fetch('/api/stats');
-  const s = await r.json();
-  renderStats(s);
-  renderClass(s.classifications);
-  renderTimeline(s.remediated_per_day);
-}
-
-async function loadIncidents() {
-  const r = await fetch('/api/incidents?limit=100');
-  const data = await r.json();
-  allIncidents = data.incidents;
-  renderFiltered();
-}
-
-async function loadAll() {
-  try {
-    await Promise.all([loadStats(), loadIncidents()]);
-    document.getElementById('last-update').textContent =
-      'Mis à jour ' + new Date().toLocaleTimeString('fr-FR');
-    lucide.createIcons();
-  } catch (e) {
-    console.error(e);
-    document.getElementById('last-update').textContent = 'Erreur — ' + e.message;
-  }
-}
-
-function renderStats(s) {
-  const cards = [
-    { key: 'total',      label: 'Incidents',     value: s.total,           unit: '' },
-    { key: 'remediated', label: 'Auto-remédiés', value: s.auto_remediated, unit: '' },
-    { key: 'rate',       label: 'Taux de succès', value: s.success_rate,   unit: '%' },
-    { key: 'mttr',       label: 'MTTR moyen',    value: s.mttr_seconds,    unit: 's' },
-    { key: 'argocd',     label: 'ArgoCD sync',   value: s.argocd_synced,   unit: '' },
-  ];
-  document.getElementById('stats').innerHTML = cards.map(c => `
-    <div class="stat">
-      <div class="stat-head">
-        <span class="stat-label">${c.label}</span>
-        <i data-lucide="${STAT_ICONS[c.key]}" class="icon stat-icon"></i>
-      </div>
-      <div class="stat-value">${c.value}<span class="stat-unit">${c.unit}</span></div>
-    </div>
-  `).join('');
-}
-
-// Chart palette — warm, single-family. No rainbow gradients.
-const PALETTE = [
-  'oklch(72% 0.13 75)',   // accent (ochre)
-  'oklch(58% 0.13 145)',  // success
-  'oklch(55% 0.18 25)',   // danger
-  'oklch(65% 0.14 240)',  // blue (rare)
-  'oklch(50% 0.10 280)',  // purple (rare)
-  'oklch(55% 0.08 40)',   // brown
-];
-
-function renderClass(data) {
-  const labels = Object.keys(data);
-  const values = Object.values(data);
-  const wrap = document.getElementById('wrap-class');
-  if (labels.length === 0) {
-    wrap.innerHTML = emptyChartHtml('chart-pie', 'Pas encore de données');
-    lucide.createIcons();
-    return;
-  }
-  if (!wrap.querySelector('canvas')) {
-    wrap.innerHTML = '<canvas id="chart-class"></canvas>';
-  }
-  if (chartClass) chartClass.destroy();
-  chartClass = new Chart(document.getElementById('chart-class'), {
-    type: 'doughnut',
-    data: { labels, datasets: [{
-      data: values,
-      backgroundColor: PALETTE,
-      borderWidth: 2,
-      borderColor: 'white',
-    }] },
-    options: {
-      responsive: true, maintainAspectRatio: false, cutout: '64%',
-      plugins: {
-        legend: { position: 'right', labels: { font: { size: 12, family: getComputedStyle(document.body).fontFamily }, padding: 12, color: 'oklch(35% 0.012 80)' } }
-      }
+    return {
+        "narrative":       narrative,
+        "kpis": {
+            "total":           total,
+            "auto_remediated": auto_remediated,
+            "success_rate":    rate,
+            "mttr_seconds":    mttr,
+            "argocd_synced":   argocd_synced,
+        },
+        "classifications": dict(classifications),
+        "severities":      dict(severities),
+        "recommendations": recommendations,
+        "risk_level":      risk,
     }
-  });
-}
 
-function renderTimeline(data) {
-  const labels = Object.keys(data);
-  const values = Object.values(data);
-  const wrap = document.getElementById('wrap-timeline');
-  if (labels.length === 0) {
-    wrap.innerHTML = emptyChartHtml('trending-up', 'Pas encore de données');
-    lucide.createIcons();
-    return;
-  }
-  if (!wrap.querySelector('canvas')) {
-    wrap.innerHTML = '<canvas id="chart-timeline"></canvas>';
-  }
-  if (chartTimeline) chartTimeline.destroy();
-  chartTimeline = new Chart(document.getElementById('chart-timeline'), {
-    type: 'bar',
-    data: { labels, datasets: [{
-      label: 'Incidents',
-      data: values,
-      backgroundColor: 'oklch(72% 0.13 75)',
-      borderRadius: 4,
-      maxBarThickness: 32,
-    }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { grid: { display: false }, ticks: { color: 'oklch(50% 0.012 80)', font: { size: 11 } } },
-        y: { beginAtZero: true, ticks: { stepSize: 1, precision: 0, color: 'oklch(50% 0.012 80)', font: { size: 11 } }, grid: { color: 'oklch(94% 0.005 80)' } }
-      }
+
+@app.get("/api/audit-report")
+async def api_audit_report(hours: int = 24):
+    """JSON audit report pour les N dernières heures (défaut 24h)."""
+    incidents = _filter_incidents_period(hours)
+    summary   = _generate_audit_summary(incidents, hours)
+    now       = datetime.now(timezone.utc)
+    return {
+        "period_hours":  hours,
+        "period_start":  (now - timedelta(hours=hours)).isoformat(),
+        "period_end":    now.isoformat(),
+        "generated_at":  now.isoformat(),
+        "incidents":     incidents,
+        "summary":       summary,
     }
-  });
-}
 
-function emptyChartHtml(icon, msg) {
-  return `<div class="empty">
-    <i data-lucide="${icon}" class="icon"></i>
-    <p>${msg}</p>
-  </div>`;
-}
 
-function escapeHtml(s) {
-  if (s === null || s === undefined) return '';
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
+@app.get("/audit-report", response_class=HTMLResponse)
+async def audit_report_html():
+    """Page HTML du rapport d'audit (imprimable Ctrl+P → PDF)."""
+    return HTMLResponse(content=_AUDIT_REPORT_HTML)
 
-function severityIcon(sev) {
-  const s = (sev || '').toLowerCase();
-  if (s === 'critical') return 'alert-octagon';
-  if (s === 'warning')  return 'alert-triangle';
-  return 'info';
-}
 
-function renderFiltered() {
-  const q = (document.getElementById('q').value || '').toLowerCase().trim();
-  const filtered = q
-    ? allIncidents.filter(i =>
-        (i.classification || '').toLowerCase().includes(q) ||
-        (i.namespace || '').toLowerCase().includes(q) ||
-        (i.pod || '').toLowerCase().includes(q) ||
-        (i.alert_name || '').toLowerCase().includes(q) ||
-        (i.severity || '').toLowerCase().includes(q)
-      )
-    : allIncidents;
-  renderIncidents(filtered, allIncidents.length);
-  lucide.createIcons();
-}
+# ── Export endpoints (/export/pptx  /export/pdf  /export/docx) ───────────────
 
-function renderIncidents(items, total) {
-  document.getElementById('incidents-count').textContent = `· ${items.length} / ${total}`;
-  const list = document.getElementById('incidents-list');
-  if (items.length === 0) {
-    list.innerHTML = total === 0
-      ? `<div class="empty">
-          <i data-lucide="inbox" class="icon"></i>
-          <p>Aucun incident traité pour le moment.</p>
-          <small>Lance une simulation : <code>POST http://localhost:8001/test-crash-loop</code></small>
-        </div>`
-      : `<div class="empty"><i data-lucide="search-x" class="icon"></i><p>Aucun incident ne correspond à la recherche.</p></div>`;
-    return;
-  }
-  list.innerHTML = items.map((i, idx) => {
-    const sev   = (i.severity || 'info').toLowerCase();
-    const sevIcon = severityIcon(sev);
-    const time  = i.timestamp ? new Date(i.timestamp).toLocaleString('fr-FR') : '—';
-    const podFull = `${i.namespace || '?'}/${i.pod || '?'}`;
-    const remediated = i.auto_remediation_applied
-      ? `<span class="badge badge-ok"><i data-lucide="check" class="icon"></i>Remédié</span>`
-      : `<span class="badge badge-skip"><i data-lucide="minus" class="icon"></i>Non appliqué</span>`;
-    const runbookHtml = (i.runbook || []).map(s => `
-      <div class="runbook-step">
-        <div class="step-action">
-          <span class="step-num">${escapeHtml(s.order)}</span>
-          ${escapeHtml(s.action)}
-        </div>
-        ${s.command ? `<div class="step-cmd">${escapeHtml(s.command)}</div>` : ''}
-        <div class="step-desc">${escapeHtml(s.description)}</div>
-      </div>
-    `).join('');
-    return `
-      <div class="incident" id="inc-${idx}">
-        <div class="incident-row" onclick="document.getElementById('inc-${idx}').classList.toggle('open'); lucide.createIcons();">
-          <i data-lucide="chevron-right" class="icon icon-sm chev"></i>
-          <span class="meta-time" title="${escapeHtml(i.timestamp || '')}">${time}</span>
-          <span class="meta-class" title="${escapeHtml(i.classification)}">
-            <i data-lucide="${sevIcon}" class="icon icon-sm"></i>
-            ${escapeHtml(i.classification)}
-          </span>
-          <span class="meta-pod" title="${escapeHtml(podFull)}">${escapeHtml(podFull)}</span>
-          <span class="badge badge-${sev}">${escapeHtml(i.severity)}</span>
-          ${remediated}
-        </div>
-        <div class="incident-body">
-          <div class="field">
-            <div class="field-label"><i data-lucide="tag" class="icon"></i>Alert name</div>
-            <div class="field-value">${escapeHtml(i.alert_name)}</div>
-          </div>
-          <div class="field">
-            <div class="field-label"><i data-lucide="file-text" class="icon"></i>Root cause</div>
-            <div class="field-value">${escapeHtml(i.root_cause)}</div>
-          </div>
-          <div class="field">
-            <div class="field-label"><i data-lucide="list-checks" class="icon"></i>Runbook · ${(i.runbook || []).length} étapes</div>
-            <div class="field-value">${runbookHtml}</div>
-          </div>
-          ${i.remediation_details ? `
-          <div class="field">
-            <div class="field-label"><i data-lucide="wrench" class="icon"></i>Remédiation appliquée</div>
-            <div class="field-value">${escapeHtml(i.remediation_details)}</div>
-          </div>` : ''}
-          <div class="field">
-            <div class="field-label"><i data-lucide="gauge" class="icon"></i>Métriques</div>
-            <div class="metrics-grid">
-              <div class="metric-item">
-                <div class="label"><i data-lucide="timer" class="icon"></i>Durée</div>
-                <div class="value">${i.duration_seconds || '?'} s</div>
-              </div>
-              <div class="metric-item">
-                <div class="label"><i data-lucide="git-commit" class="icon"></i>Git</div>
-                <div class="value">${escapeHtml(i.git_pr_url || 'aucun')}</div>
-              </div>
-              <div class="metric-item">
-                <div class="label"><i data-lucide="git-branch" class="icon"></i>ArgoCD</div>
-                <div class="value">${i.argocd_sync_triggered ? 'sync déclenché' : 'non'}</div>
-              </div>
-            </div>
-          </div>
-          <div class="field">
-            <div class="field-label"><i data-lucide="code" class="icon"></i>Payload JSON</div>
-            <pre class="raw-json">${escapeHtml(JSON.stringify(i, null, 2))}</pre>
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
-}
+@app.get("/export/pptx")
+async def export_pptx(hours: int = 24):
+    """Génère et télécharge un rapport PowerPoint."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
 
-loadAll();
-setInterval(() => {
-  if (document.getElementById('auto-refresh').checked) loadAll();
-}, 30000);
-</script>
-</body>
-</html>
-"""
+    incidents = _filter_incidents_period(hours)
+    summary   = _generate_audit_summary(incidents, hours)
+    now       = datetime.now(timezone.utc)
+    kpis      = summary["kpis"]
+
+    ORANGE  = RGBColor(0xDC, 0x69, 0x00)
+    ORANGED = RGBColor(0xC4, 0x4A, 0x00)
+    WHITE   = RGBColor(0xFF, 0xFF, 0xFF)
+    BLACK   = RGBColor(0x1A, 0x1A, 0x1A)
+    GREY    = RGBColor(0x66, 0x66, 0x66)
+    LGREY   = RGBColor(0xF5, 0xF4, 0xF2)
+
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    def add_rect(sld, l, t, w, h, rgb):
+        sp = sld.shapes.add_shape(1, l, t, w, h)
+        sp.fill.solid(); sp.fill.fore_color.rgb = rgb
+        sp.line.fill.background()
+
+    def add_txt(sld, text, l, t, w, h, size=14, bold=False, rgb=BLACK, center=False, wrap=True):
+        tb = sld.shapes.add_textbox(l, t, w, h)
+        tf = tb.text_frame; tf.word_wrap = wrap
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER if center else PP_ALIGN.LEFT
+        r = p.add_run(); r.text = str(text)
+        r.font.size = Pt(size); r.font.bold = bold; r.font.color.rgb = rgb
+
+    def tbl_cell(cell, text, rgb_bg=None, bold=False, size=12, rgb_fg=BLACK):
+        cell.text = str(text)
+        if rgb_bg:
+            cell.fill.solid(); cell.fill.fore_color.rgb = rgb_bg
+        for para in cell.text_frame.paragraphs:
+            for run in para.runs:
+                run.font.size = Pt(size); run.font.bold = bold; run.font.color.rgb = rgb_fg
+
+    # Slide 1 — Couverture (design PwC : fond pêche + formes oranges)
+    s1 = prs.slides.add_slide(blank)
+    # Fond crème blanc
+    add_rect(s1, Inches(0), Inches(0), prs.slide_width, prs.slide_height, RGBColor(0xFF, 0xFC, 0xF8))
+    # Dégradé pêche simulé coin haut-droit (3 rects transparents)
+    add_rect(s1, Inches(8.0), Inches(0), Inches(5.33), Inches(4.0), RGBColor(0xFF, 0xE4, 0xC8))
+    add_rect(s1, Inches(9.5), Inches(0), Inches(3.83), Inches(2.5), RGBColor(0xFF, 0xCE, 0xA8))
+    add_rect(s1, Inches(11.0), Inches(0), Inches(2.33), Inches(1.5), RGBColor(0xFF, 0xB8, 0x88))
+    # Remettre fond blanc par-dessus gauche pour adoucir
+    add_rect(s1, Inches(0), Inches(0), Inches(8.5), Inches(5.0), RGBColor(0xFF, 0xFC, 0xF8))
+    # Logo PwC (texte fallback car image difficile à embarquer en PPTX sans chemin)
+    add_txt(s1, "pw", Inches(0.55), Inches(0.3), Inches(0.7), Inches(0.6), size=28, bold=True, rgb=BLACK)
+    add_txt(s1, "c",  Inches(1.15), Inches(0.3), Inches(0.4), Inches(0.6), size=28, bold=True, rgb=ORANGE)
+    # Date haut-droite
+    add_txt(s1, now.strftime("%d/%m/%Y %H:%M"), Inches(9.0), Inches(0.35), Inches(4.0), Inches(0.5), size=10, rgb=GREY)
+    # Grand titre
+    add_txt(s1, "Rapport", Inches(0.55), Inches(1.5), Inches(8.0), Inches(1.2), size=58, bold=True, rgb=BLACK)
+    add_txt(s1, "D'audit", Inches(0.55), Inches(2.6), Inches(8.0), Inches(1.2), size=58, bold=True, rgb=BLACK)
+    # Sous-titre
+    add_txt(s1, "Alertes Kubernetes & remédiation SRE", Inches(0.55), Inches(4.0), Inches(9.0), Inches(0.6), size=16, bold=True, rgb=RGBColor(0x28,0x28,0x28))
+    # Métadonnées
+    add_txt(s1, f"Période : {hours}h  ·  Généré le {now.strftime('%d/%m/%Y à %H:%M')} UTC",
+            Inches(0.55), Inches(4.55), Inches(9.0), Inches(0.5), size=11, rgb=GREY)
+    # Forme gauche (orange foncé) — parallélogramme bas
+    from pptx.util import Emu
+    sp_back = s1.shapes.add_shape(6, Inches(0), Inches(5.35), Inches(7.5), Inches(0.88))
+    sp_back.fill.solid(); sp_back.fill.fore_color.rgb = ORANGED
+    sp_back.line.fill.background()
+    # Forme droite (orange vif)
+    sp_front = s1.shapes.add_shape(6, Inches(2.8), Inches(5.0), Inches(7.5), Inches(0.88))
+    sp_front.fill.solid(); sp_front.fill.fore_color.rgb = ORANGE
+    sp_front.line.fill.background()
+
+    # Slide 2 — KPIs
+    s2 = prs.slides.add_slide(blank)
+    add_rect(s2, Inches(0), Inches(0), prs.slide_width, Inches(1.1), ORANGE)
+    add_txt(s2, "Résumé exécutif", Inches(0.5), Inches(0.15), Inches(9), Inches(0.8), size=28, bold=True, rgb=WHITE)
+    for i, (lbl, val) in enumerate([
+        ("Incidents traités",  kpis["total"]),
+        ("Auto-remédiés",      kpis["auto_remediated"]),
+        ("Taux de succès",     f"{kpis['success_rate']}%"),
+        ("MTTR moyen",         f"{kpis['mttr_seconds']:.0f}s"),
+    ]):
+        x = Inches(0.4 + i * 3.2)
+        add_rect(s2, x, Inches(1.3), Inches(3.0), Inches(1.9), LGREY)
+        add_txt(s2, str(val), x, Inches(1.45), Inches(3.0), Inches(1.0), size=38, bold=True, rgb=ORANGE, center=True)
+        add_txt(s2, lbl,      x, Inches(2.55), Inches(3.0), Inches(0.5), size=12, rgb=GREY, center=True)
+    add_txt(s2, summary["narrative"], Inches(0.5), Inches(3.4), Inches(12.3), Inches(2.5), size=13, wrap=True)
+
+    # Slide 3 — Classifications
+    s3 = prs.slides.add_slide(blank)
+    add_rect(s3, Inches(0), Inches(0), prs.slide_width, Inches(1.1), ORANGE)
+    add_txt(s3, "Répartition par classification", Inches(0.5), Inches(0.15), Inches(10), Inches(0.8), size=28, bold=True, rgb=WHITE)
+    classes = sorted(summary["classifications"].items(), key=lambda x: -x[1])
+    if classes:
+        rows = len(classes) + 1
+        tbl = s3.shapes.add_table(rows, 2, Inches(1.0), Inches(1.4), Inches(7.0),
+                                   Inches(min(5.5, rows * 0.55))).table
+        tbl.columns[0].width = Inches(5); tbl.columns[1].width = Inches(2)
+        tbl_cell(tbl.cell(0, 0), "Classification", ORANGE, True, 13, WHITE)
+        tbl_cell(tbl.cell(0, 1), "Incidents",      ORANGE, True, 13, WHITE)
+        for ri, (cls, cnt) in enumerate(classes, 1):
+            bg = LGREY if ri % 2 == 0 else None
+            tbl_cell(tbl.cell(ri, 0), cls,      bg, False, 12)
+            tbl_cell(tbl.cell(ri, 1), str(cnt), bg, False, 12)
+
+    # Slide 4 — Journal des incidents
+    s4 = prs.slides.add_slide(blank)
+    add_rect(s4, Inches(0), Inches(0), prs.slide_width, Inches(1.1), ORANGE)
+    add_txt(s4, "Journal des incidents", Inches(0.5), Inches(0.15), Inches(10), Inches(0.8), size=28, bold=True, rgb=WHITE)
+    recent = incidents[:15]
+    if recent:
+        rows = len(recent) + 1
+        tbl = s4.shapes.add_table(rows, 4, Inches(0.2), Inches(1.3), Inches(12.9),
+                                   Inches(min(5.9, rows * 0.42))).table
+        for c, w in enumerate([Inches(2.2), Inches(3.0), Inches(2.0), Inches(5.7)]):
+            tbl.columns[c].width = w
+        for c, h in enumerate(["Horodatage", "Classification", "Sévérité", "Pod"]):
+            tbl_cell(tbl.cell(0, c), h, ORANGE, True, 12, WHITE)
+        for ri, inc in enumerate(recent, 1):
+            bg = LGREY if ri % 2 == 0 else None
+            for c, val in enumerate([
+                inc.get("timestamp", "")[:16].replace("T", " "),
+                inc.get("classification", "Unknown"),
+                inc.get("severity", "—"),
+                inc.get("pod_name", inc.get("pod", "—")),
+            ]):
+                tbl_cell(tbl.cell(ri, c), val, bg, False, 11)
+
+    buf = BytesIO(); prs.save(buf); buf.seek(0)
+    fname = f"SRE-Copilot-{hours}h-{now.strftime('%Y%m%d-%H%M')}.pptx"
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+@app.get("/export/pdf")
+async def export_pdf(hours: int = 24):
+    """Génère et télécharge un rapport PDF avec design PwC fidèle à la page HTML."""
+    from fpdf import FPDF
+
+    incidents = _filter_incidents_period(hours)
+    summary   = _generate_audit_summary(incidents, hours)
+    now       = datetime.now(timezone.utc)
+    kpis      = summary["kpis"]
+
+    FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+
+    class AuditPDF(FPDF):
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Body", "", 7.5)
+            self.set_text_color(160, 160, 160)
+            self.cell(0, 8, f"SRE Copilot  ·  Rapport d'audit {hours}h  ·  Page {self.page_no()}", align="C")
+
+    pdf = AuditPDF()
+    pdf.add_font("Body",  "",  f"{FONT_DIR}/DejaVuSans.ttf")
+    pdf.add_font("Body",  "B", f"{FONT_DIR}/DejaVuSans-Bold.ttf")
+    pdf.add_font("Body",  "I", f"{FONT_DIR}/DejaVuSans-Oblique.ttf")
+    pdf.add_font("Serif", "",  f"{FONT_DIR}/DejaVuSerif.ttf")
+    pdf.add_font("Serif", "B", f"{FONT_DIR}/DejaVuSerif-Bold.ttf")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(15, 15, 15)
+
+    # ── Palette exacte du HTML ──
+    ORANGE   = (220, 105,   0)   # --orange principal
+    ORANGE_D = (180,  64,   0)   # forme gauche (foncée)
+    ORANGE_B = (232,  93,   4)   # forme droite (vive)
+    CREAM_R  = (255, 248, 244)   # fond pêche coin haut-droit (simulé par un dégradé de rects)
+    CREAM_W  = (255, 253, 251)   # fond crème blanc
+    GREY     = (100, 100, 100)
+    INK      = ( 26,  26,  26)
+    ROW_ALT  = (248, 245, 242)
+    BORDER   = (220, 220, 220)
+
+    # ── Helper: bande orange en-tête de page de contenu ──
+    def page_header(title):
+        # Bande orange pleine largeur
+        pdf.set_fill_color(*ORANGE)
+        pdf.rect(0, 0, 210, 18, "F")
+        pdf.set_xy(14, 3.5)
+        pdf.set_font("Serif", "B", 15)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 11, title)
+        # Breadcrumb discret
+        pdf.set_xy(14, 22)
+        pdf.set_font("Body", "", 7.5)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 5, "RAPPORT D'AUDIT  ·  ALERTES KUBERNETES & REMÉDIATION SRE")
+        pdf.set_text_color(*INK)
+        pdf.set_xy(14, 32)
+
+    # ══════════════════════════════════════════════════════
+    # PAGE 1 — COUVERTURE (fidèle au PDF du design HTML)
+    # ══════════════════════════════════════════════════════
+    pdf.add_page()
+
+    # Fond blanc crème sur toute la page
+    pdf.set_fill_color(*CREAM_W)
+    pdf.rect(0, 0, 210, 297, "F")
+
+    # Dégradé pêche simulé coin haut-droit (3 rectangles de plus en plus transparents)
+    pdf.set_fill_color(255, 228, 200)
+    pdf.rect(140, 0, 70, 80, "F")
+    pdf.set_fill_color(255, 238, 218)
+    pdf.rect(120, 0, 90, 60, "F")
+    pdf.set_fill_color(255, 248, 240)
+    pdf.rect(100, 0, 110, 40, "F")
+    # Remettre le fond crème par-dessus pour adoucir
+    pdf.set_fill_color(255, 252, 248)
+    pdf.rect(0, 0, 105, 100, "F")
+
+    # ── Logo PwC haut-gauche ──
+    try:
+        pdf.image("logo_pwc.png", 14, 16, w=26)
+    except Exception:
+        # Fallback texte si logo absent
+        pdf.set_font("Serif", "B", 20)
+        pdf.set_text_color(40, 40, 40)
+        pdf.set_xy(14, 14)
+        pdf.cell(15, 10, "pw")
+        pdf.set_text_color(*ORANGE_B)
+        pdf.set_xy(29, 14)
+        pdf.cell(8, 10, "c")
+
+    # ── Date haut-droite ──
+    pdf.set_font("Body", "", 9)
+    pdf.set_text_color(*GREY)
+    pdf.set_xy(110, 18)
+    pdf.cell(86, 7, now.strftime("%d/%m/%Y %H:%M"), align="R")
+
+    # ── Grand titre Serif (exact comme le HTML .cover-h1) ──
+    pdf.set_text_color(*INK)
+    pdf.set_font("Serif", "B", 58)
+    pdf.set_xy(14, 68)
+    pdf.cell(0, 26, "Rapport")
+    pdf.set_xy(14, 94)
+    pdf.cell(0, 26, "D'audit")
+
+    # ── Sous-titre en gras ──
+    pdf.set_font("Body", "B", 14)
+    pdf.set_text_color(40, 40, 40)
+    pdf.set_xy(14, 130)
+    pdf.cell(0, 8, "Alertes Kubernetes & remédiation SRE")
+
+    # ── Métadonnées ──
+    pdf.set_font("Body", "", 9)
+    pdf.set_text_color(*GREY)
+    pdf.set_xy(14, 143)
+    pdf.cell(90, 6, f"Période : {hours}h")
+    pdf.set_xy(14, 150)
+    pdf.cell(90, 6, f"Généré le {now.strftime('%d/%m/%Y à %H:%M')} UTC")
+
+    # ── Deux parallélogrammes PwC bas de page ──
+    # Position: ~57% de 297mm ≈ y=169, deux formes qui se chevauchent
+    # Forme gauche (foncée, déborde à gauche)
+    pdf.set_fill_color(*ORANGE_D)
+    pdf.polygon([(-8, 192), (148, 192), (134, 218), (-22, 218)], fill=True)
+    # Forme droite (orange vive, devant)
+    pdf.set_fill_color(*ORANGE_B)
+    pdf.polygon([(88, 178), (244, 178), (230, 204), ( 74, 204)], fill=True)
+
+    # ══════════════════════════════════════════════════════
+    # PAGE 2 — RÉSUMÉ EXÉCUTIF
+    # ══════════════════════════════════════════════════════
+    pdf.add_page()
+    page_header("Résumé exécutif")
+
+    # 4 KPI cards côte à côte (comme le HTML .kpi-grid)
+    kpi_colors = [
+        (30,  96, 128),   # bleu acier   — total
+        (139, 31,  31),   # bordeaux     — auto-remédiés
+        (196, 74,   0),   # orange foncé — taux
+        (232, 93,   4),   # orange vif   — MTTR
+    ]
+    kpi_data = [
+        ("Total incidents",  str(kpis["total"])),
+        ("Auto-remédiés",    str(kpis["auto_remediated"])),
+        ("Taux de succès",   f"{kpis['success_rate']}%"),
+        ("MTTR moyen",       f"{kpis['mttr_seconds']:.0f}s"),
+    ]
+    card_w, card_h = 43, 30
+    for i, ((lbl, val), color) in enumerate(zip(kpi_data, kpi_colors)):
+        bx = 14 + i * (card_w + 2)
+        # Fond coloré de la carte
+        pdf.set_fill_color(*color)
+        pdf.rect(bx, 32, card_w, card_h, "F")
+        # Valeur grande
+        pdf.set_xy(bx, 34)
+        pdf.set_font("Serif", "B", 22)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(card_w, 14, val, align="C")
+        # Label
+        pdf.set_xy(bx, 50)
+        pdf.set_font("Body", "", 7.5)
+        pdf.set_text_color(255, 255, 220)
+        pdf.cell(card_w, 7, lbl, align="C")
+
+    # Narrative
+    pdf.set_xy(14, 72)
+    pdf.set_font("Body", "", 10.5)
+    pdf.set_text_color(*INK)
+    pdf.multi_cell(182, 6, summary["narrative"])
+
+    # Niveau de risque (bandeau coloré)
+    risk = summary.get("risk_level", "low")
+    risk_colors = {"low": (45, 122, 62), "medium": (184, 110, 0), "high": (184, 27, 27)}
+    risk_bgs    = {"low": (238, 247, 239), "medium": (255, 244, 229), "high": (251, 240, 240)}
+    risk_labels = {"low": "Niveau de risque · FAIBLE", "medium": "Niveau de risque · MODÉRÉ", "high": "Niveau de risque · ÉLEVÉ"}
+    rc  = risk_colors.get(risk, (45, 122, 62))
+    rbg = risk_bgs.get(risk, (238, 247, 239))
+    rl  = risk_labels.get(risk, "—")
+    cy  = pdf.get_y() + 6
+    pdf.set_fill_color(*rbg)
+    pdf.rect(14, cy, 182, 12, "F")
+    pdf.set_fill_color(*rc)
+    pdf.rect(14, cy, 3, 12, "F")
+    pdf.set_xy(20, cy + 2)
+    pdf.set_font("Body", "B", 9)
+    pdf.set_text_color(*rc)
+    pdf.cell(0, 7, rl)
+
+    # ══════════════════════════════════════════════════════
+    # PAGE 3 — CLASSIFICATIONS
+    # ══════════════════════════════════════════════════════
+    pdf.add_page()
+    page_header("Répartition par classification")
+    classes = sorted(summary["classifications"].items(), key=lambda x: -x[1])
+    if classes:
+        # En-tête tableau
+        pdf.set_font("Body", "B", 10)
+        pdf.set_fill_color(*ORANGE)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(140, 10, "  Classification", border=0, fill=True)
+        pdf.cell( 40, 10, "Incidents", border=0, fill=True, align="C")
+        pdf.ln()
+        pdf.set_font("Body", "", 10)
+        for i, (cls, cnt) in enumerate(classes):
+            bg = ROW_ALT if i % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(*bg)
+            pdf.set_text_color(*INK)
+            pdf.cell(140, 9, "  " + cls, border=0, fill=True)
+            pdf.cell( 40, 9, str(cnt), border=0, fill=True, align="C")
+            pdf.ln()
+    else:
+        pdf.set_font("Body", "I", 10)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 8, "Aucune classification sur la période.")
+
+    # ══════════════════════════════════════════════════════
+    # PAGE 4 — JOURNAL DES INCIDENTS
+    # ══════════════════════════════════════════════════════
+    pdf.add_page()
+    page_header("Journal des incidents")
+    recent = incidents[:30]
+    if recent:
+        cols = [
+            ("Horodatage",     35),
+            ("Classification", 48),
+            ("Sévérité",       26),
+            ("Pod",            70),
+            ("Rem.",           11),
+        ]
+        pdf.set_font("Body", "B", 8.5)
+        pdf.set_fill_color(*ORANGE)
+        pdf.set_text_color(255, 255, 255)
+        for h, w in cols:
+            pdf.cell(w, 9, " " + h, border=0, fill=True)
+        pdf.ln()
+        pdf.set_font("Body", "", 8)
+        for i, inc in enumerate(recent):
+            pdf.set_fill_color(*(ROW_ALT if i % 2 == 0 else (255, 255, 255)))
+            pdf.set_text_color(*INK)
+            pod = str(inc.get("pod_name", inc.get("pod", "—")))
+            rem = "Oui" if inc.get("auto_remediation_applied") else "Non"
+            for val, w in [
+                (inc.get("timestamp", "")[:16].replace("T", " "), 35),
+                (str(inc.get("classification", "Unknown"))[:26],   48),
+                (str(inc.get("severity", "—")),                    26),
+                (pod[:36],                                          70),
+                (rem,                                               11),
+            ]:
+                pdf.cell(w, 7, " " + str(val), border=0, fill=True)
+            pdf.ln()
+    else:
+        pdf.set_font("Body", "I", 10)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 8, "Aucun incident enregistré sur cette période.")
+
+    buf = BytesIO(pdf.output())
+    fname = f"SRE-Copilot-{hours}h-{now.strftime('%Y%m%d-%H%M')}.pdf"
+    return StreamingResponse(buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+@app.get("/export/docx")
+async def export_docx(hours: int = 24):
+    """Génère et télécharge un rapport Word."""
+    from docx import Document
+    from docx.shared import Pt, RGBColor as DocRGB, Cm
+
+    incidents = _filter_incidents_period(hours)
+    summary   = _generate_audit_summary(incidents, hours)
+    now       = datetime.now(timezone.utc)
+    kpis      = summary["kpis"]
+
+    ORANGE  = DocRGB(0xDC, 0x69, 0x00)
+    ORANGED = DocRGB(0xB4, 0x40, 0x00)
+    BLACK   = DocRGB(0x1A, 0x1A, 0x1A)
+    GREY    = DocRGB(0x64, 0x64, 0x64)
+
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+    for sec in doc.sections:
+        sec.top_margin    = Cm(2.0)
+        sec.bottom_margin = Cm(2.0)
+        sec.left_margin   = sec.right_margin = Cm(2.5)
+
+    def set_para_spacing(p, before=0, after=0):
+        pPr = p._p.get_or_add_pPr()
+        spacing = OxmlElement('w:spacing')
+        spacing.set(qn('w:before'), str(before))
+        spacing.set(qn('w:after'), str(after))
+        pPr.append(spacing)
+
+    def set_para_shading(p, fill_hex):
+        pPr = p._p.get_or_add_pPr()
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), fill_hex)
+        pPr.append(shd)
+
+    # ── Logo PwC (texte stylisé) ──
+    p_logo = doc.add_paragraph()
+    set_para_spacing(p_logo, before=0, after=60)
+    r_pw = p_logo.add_run("pw")
+    r_pw.font.size = Pt(28); r_pw.font.bold = True; r_pw.font.color.rgb = BLACK
+    r_c = p_logo.add_run("c")
+    r_c.font.size = Pt(28); r_c.font.bold = True; r_c.font.color.rgb = ORANGE
+
+    # ── Ligne de séparation orange ──
+    p_line = doc.add_paragraph()
+    set_para_spacing(p_line, before=0, after=280)
+    p_line.paragraph_format.border_bottom = True
+    pPr = p_line._p.get_or_add_pPr()
+    pBdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '12')
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), 'DC6900')
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+    # ── Grand titre ──
+    p_t1 = doc.add_paragraph()
+    set_para_spacing(p_t1, before=0, after=0)
+    r_t1 = p_t1.add_run("Rapport")
+    r_t1.font.size = Pt(48); r_t1.font.bold = True; r_t1.font.color.rgb = BLACK
+    r_t1.font.name = "Georgia"
+
+    p_t2 = doc.add_paragraph()
+    set_para_spacing(p_t2, before=0, after=200)
+    r_t2 = p_t2.add_run("D'audit")
+    r_t2.font.size = Pt(48); r_t2.font.bold = True; r_t2.font.color.rgb = BLACK
+    r_t2.font.name = "Georgia"
+
+    # ── Sous-titre ──
+    p_sub = doc.add_paragraph()
+    set_para_spacing(p_sub, before=0, after=100)
+    r_sub = p_sub.add_run("Alertes Kubernetes & remédiation SRE")
+    r_sub.font.size = Pt(14); r_sub.font.bold = True; r_sub.font.color.rgb = BLACK
+
+    # ── Métadonnées ──
+    p_meta = doc.add_paragraph()
+    set_para_spacing(p_meta, before=0, after=400)
+    r_meta = p_meta.add_run(
+        f"Période : {hours} dernières heures   ·   "
+        f"Généré le {now.strftime('%d/%m/%Y à %H:%M')} UTC   ·   Confidentiel"
+    )
+    r_meta.font.size = Pt(9); r_meta.font.color.rgb = GREY
+
+    # ── Bloc orange décoratif (simule les formes PwC) ──
+    p_bar1 = doc.add_paragraph()
+    set_para_spacing(p_bar1, before=0, after=8)
+    set_para_shading(p_bar1, 'B44000')
+    r_bar1 = p_bar1.add_run("  ")
+    r_bar1.font.size = Pt(16)
+
+    p_bar2 = doc.add_paragraph()
+    set_para_spacing(p_bar2, before=0, after=600)
+    set_para_shading(p_bar2, 'E85D04')
+    r_bar2 = p_bar2.add_run("  ")
+    r_bar2.font.size = Pt(16)
+
+    doc.add_page_break()
+
+    # Section 1 — Résumé
+    h1 = doc.add_heading("1. Résumé exécutif", level=1)
+    h1.runs[0].font.color.rgb = ORANGE
+    doc.add_paragraph(summary["narrative"])
+    doc.add_paragraph()
+    kpi_tbl = doc.add_table(2, 4); kpi_tbl.style = "Table Grid"
+    for i, (lbl, val) in enumerate([
+        ("Incidents traités",  str(kpis["total"])),
+        ("Auto-remédiés",      str(kpis["auto_remediated"])),
+        ("Taux de succès",     f"{kpis['success_rate']}%"),
+        ("MTTR moyen",         f"{kpis['mttr_seconds']:.0f}s"),
+    ]):
+        kpi_tbl.cell(0, i).text = lbl
+        kpi_tbl.cell(0, i).paragraphs[0].runs[0].font.bold = True
+        kpi_tbl.cell(1, i).text = val
+        for run in kpi_tbl.cell(1, i).paragraphs[0].runs:
+            run.font.size = Pt(16); run.font.bold = True; run.font.color.rgb = ORANGE
+    doc.add_paragraph()
+
+    # Section 2 — Classifications
+    h2 = doc.add_heading("2. Répartition par classification", level=1)
+    h2.runs[0].font.color.rgb = ORANGE
+    classes = sorted(summary["classifications"].items(), key=lambda x: -x[1])
+    if classes:
+        cls_tbl = doc.add_table(len(classes) + 1, 2); cls_tbl.style = "Table Grid"
+        for c, h in enumerate(["Classification", "Incidents"]):
+            cls_tbl.cell(0, c).text = h
+            cls_tbl.cell(0, c).paragraphs[0].runs[0].font.bold = True
+        for ri, (cls, cnt) in enumerate(classes, 1):
+            cls_tbl.cell(ri, 0).text = cls; cls_tbl.cell(ri, 1).text = str(cnt)
+    doc.add_paragraph()
+
+    # Section 3 — Incidents
+    h3 = doc.add_heading("3. Journal détaillé des incidents", level=1)
+    h3.runs[0].font.color.rgb = ORANGE
+    sample = incidents[:50]
+    if sample:
+        inc_tbl = doc.add_table(len(sample) + 1, 5); inc_tbl.style = "Table Grid"
+        for c, h in enumerate(["Horodatage", "Classification", "Sévérité", "Pod", "Remédiation"]):
+            inc_tbl.cell(0, c).text = h
+            inc_tbl.cell(0, c).paragraphs[0].runs[0].font.bold = True
+        for ri, inc in enumerate(sample, 1):
+            for c, val in enumerate([
+                inc.get("timestamp", "")[:16].replace("T", " "),
+                inc.get("classification", "Unknown"),
+                inc.get("severity", "—"),
+                inc.get("pod_name", inc.get("pod", "—")),
+                "Oui" if inc.get("auto_remediation_applied") else "Non",
+            ]):
+                inc_tbl.cell(ri, c).text = str(val)
+                for run in inc_tbl.cell(ri, c).paragraphs[0].runs:
+                    run.font.size = Pt(9)
+    else:
+        doc.add_paragraph("Aucun incident enregistré sur cette période.")
+
+    buf = BytesIO(); doc.save(buf); buf.seek(0)
+    fname = f"SRE-Copilot-{hours}h-{now.strftime('%Y%m%d-%H%M')}.docx"
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ── HTML pages servies par /dashboard et /audit-report ────────────────────
+# Externalisees dans html_pages.py pour separer code Python (lisible) et HTML (volumineux)
+from html_pages import DASHBOARD_HTML as _DASHBOARD_HTML, AUDIT_REPORT_HTML as _AUDIT_REPORT_HTML

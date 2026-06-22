@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.pytest-tmp/
 
 # ── Environnement & secrets ──
 .env
